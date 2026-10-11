@@ -1,0 +1,12 @@
+FROM python:3.11-slim-bookworm AS builder
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir --target=/deps -r requirements.txt
+
+FROM python:3.11-slim-bookworm
+WORKDIR /app
+COPY --from=builder /deps /deps
+COPY main.py .
+ENV PYTHONPATH=/deps
+EXPOSE 8080
+CMD ["python", "main.py"]

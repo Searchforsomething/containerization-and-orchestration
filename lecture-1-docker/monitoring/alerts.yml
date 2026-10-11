@@ -1,0 +1,28 @@
+groups:
+  - name: container-limits
+    rules:
+      - alert: ContainerMemoryNearLimit
+        expr: |
+          max by (name) (container_memory_working_set_bytes{name!=""})
+            / max by (name) (container_spec_memory_limit_bytes{name!=""} > 0)
+          > 0.9
+        for: 1m
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $labels.name }}: память >90% от лимита"
+
+      - alert: ContainerCPUThrottled
+        expr: |
+          sum by (name) (rate(container_cpu_cfs_throttled_periods_total{name!=""}[2m]))
+            / sum by (name) (rate(container_cpu_cfs_periods_total{name!=""}[2m]))
+          > 0.25
+        for: 2m
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $labels.name }}: CPU throttling >25% периодов"
+
+      - alert: ContainerOOMKilled
+        expr: increase(container_oom_events_total{name!=""}[5m]) > 0
+        labels: {severity: critical}
+        annotations:
+          summary: "{{ $labels.name }}: процесс убит по OOM"

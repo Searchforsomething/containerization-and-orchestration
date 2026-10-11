@@ -1,233 +1,271 @@
-# Lecture 1 — Docker: containers and images under the hood
+# Лаба 1 -- Свой Docker
 
-We write `Dockerfile`s, run `docker run`, and ship manifests every day, yet what happens under the hood usually stays a black box. This lecture answers one question: what a container is at the operating-system level, how an image is built, and what path `docker run` travels before a service starts. The point is practical — when something breaks off-script, a list of commands stops helping and a mental model takes over. It turns familiar pains (`OOMKilled`, `CrashLoopBackOff`, "the data vanished", "the service is slow with no errors") into a quick diagnosis, and it guides engineering decisions: which base image, which limits, where the security boundary is.
+Сервис `api` -- Python 3 + Flask ([main.py](main.py)). Эндпоинты:
 
-One example runs through the whole course — an online shop with three services: `api` (handles HTTP requests, stateless, runs as several identical replicas), `worker` (processes orders in the background), and `postgres` (stores data). Today only `api` matters, and only one question: what happens when we package it into a container and run it.
+- `GET /health` -- возвращает `ok`;
+- `GET /eat?mb=N` -- выделяет N МБ и держит их;
+- `GET /burn` -- бесконечный цикл, грузит одно ядро.
 
----
+Стенд: Ubuntu, cgroup v2, сервис запускался из venv (`.venv/bin/python main.py`), порт 8080.
 
-## Block 1. A container is a process
-
-### Base terms
-
-- **Host** — the machine everything runs on: a server, a cluster node, or a laptop.
-- **Process** — a running program: its own PID, memory, and code.
-- **Kernel** — the core of the OS: hands out CPU time and memory, manages files, network, devices. Runs in the privileged "kernel space".
-- Normal programs run in "user space" and never touch hardware directly.
-- **System call (syscall)** — the only way for a user-space process to ask the kernel for something: open a file, create a connection, allocate memory.
-- **Daemon** — a background service program (e.g. `dockerd`).
-
-### The core myth
-
-A container is not a lightweight virtual machine. There is no guest OS and no second kernel inside. A container is an ordinary Linux process on the host's shared kernel, to which the kernel gives an altered view of the system and capped resources. Everything "container-like" about it is settings of one shared kernel.
-
-### VM vs container
-
-In virtualization a hypervisor slices a server into VMs, each running its own full guest kernel — a very strong but heavy boundary (each kernel costs memory and startup time). Containers share one kernel, which is itself the boundary. Hence the upsides: containers start in milliseconds, weigh almost nothing, hundreds fit on one machine. Hence also the caveat for the whole course: with a shared kernel, isolation is thinner than a VM's.
-
-### One process, two views
-
-Run `api` via `docker run` and do `ps` on the host — `api` shows up as an ordinary process next to `systemd` and `sshd`, with a large PID. Inside the container (`docker exec` + `ps`) the same process appears as **PID 1**, as if it were first and foremost. From outside — one process among hundreds; from inside — the sole inhabitant of its world. The lecture is about how the kernel builds that second view.
-
-### Three kernel mechanisms
-
-Container = an ordinary process + three groups of Linux kernel mechanisms:
-
-- **namespaces** — what the process *sees* (its own process list, network, filesystem);
-- **cgroups** — how much it *may use* (memory, CPU, disk, process count);
-- **privilege tightening** — what it is *allowed to do* (capabilities, seccomp, LSM).
-
-`docker`, `containerd`, `runc` do not invent isolation — they just configure these kernel mechanisms, correctly and in the right order.
-
-### namespaces: what the process sees
-
-A namespace takes a shared system resource and gives the process a private copy:
-
-- **pid** — own process list and numbering (the main process becomes PID 1);
-- **net** — own network stack: interfaces, IPs, ports, firewall rules;
-- **mnt** — own filesystem and root;
-- **uts** — own hostname;
-- **user** — own user mapping (root inside can be an unprivileged user outside).
-
-Key point: namespaces isolate *visibility*, not *capacity* — they do not stop the process from eating all memory.
-
-### The PID 1 trap
-
-In Linux, PID 1 must reap terminated child processes (collect zombies). Normally `systemd` does this; in a container PID 1 is your `api`, which knows nothing about the duty. Result: orphaned processes pile up as zombies, and the container may not stop on `docker stop` (PID 1 mishandles the termination signal and is only killed after the timeout). Fix: either the app handles signals properly, or run it under a tiny init — in Docker the `--init` flag, which injects `tini`.
-
-### net namespace: its own network
-
-The container has a full network stack, empty at start. Connectivity comes from a `veth` pair — a virtual patch cable with two ends: one appears inside as `eth0`, the other stays on the host and plugs into a bridge. A consequence of port isolation: two containers can both listen on port 8080 without conflict — they are in different net namespaces. A conflict only arises when a port is published to the host itself.
-
-### mnt namespace: where the filesystem comes from
-
-The container's root is not the host but a minimal environment from the image (unpacked layers merged together; details in Block 2). The root switch uses not old `chroot` (escapable under some privileges) but `pivot_root`: the new root becomes real, the old host root is detached so it cannot be reached. Service filesystems — `/proc`, `/sys`, `/dev` — and data volumes are mounted on top.
-
-### user namespace: root inside ≠ root outside
-
-Linux users are numbers (uid); root is uid 0. A user namespace can say: "uid 0 inside the container is really uid 100000 outside." The process thinks it is root in its own world, while the host kernel sees an unprivileged user. This is the basis of rootless containers and sharply limits damage from an escape: a broken-out attacker lands as a harmless uid 100000. By default the user namespace is often off — then root inside is root outside, and the cost of escape is maximal. The reason is historical compatibility, but the industry is moving toward enabling it.
-
-### cgroups: how much the process may use
-
-Namespaces hid the rest of the system but said nothing about resources — the process can still allocate memory to the last byte and load every core. On a shared node that is the "noisy neighbor". cgroups (control groups) group processes and attach limits and counters: memory, CPU time, disk operations, even the number of processes (process count is a resource too — otherwise one bug forks until the node falls over). Everything you write as memory/cpu limits in Docker or `resources` in Kubernetes becomes cgroup settings.
-
-### Memory limit and OOMKilled
-
-A cgroup has a hard memory ceiling. On overrun the kernel first tries to free memory within the group (drop caches); if there is nothing to give, OOM fires and the kernel forcibly kills a process in that group. Only the offender is hit; the rest of the node is fine. In Kubernetes: the container crosses its limit → status `OOMKilled` → kubelet restarts it. Takeaway: `OOMKilled` almost never means "the node ran out of memory" — it means "this container exceeded its limit". Fix by raising the limit honestly or hunting a leak. If it loops — start, eat, get killed, restart — you get `CrashLoopBackOff`.
-
-### CPU limit and throttling
-
-CPU behaves differently. Memory is all-or-nothing: run short and something gets killed. CPU is divisible in time: on hitting the ceiling the process is not killed but slowed until the next short period — **throttling**. Two cgroup parameters set this: a share under contention (like requests — your fair share when things are tight) and a hard quota (like limits — hitting it causes throttling). A sneaky case: the container looks healthy by all metrics, does not crash, but answers slowly and unevenly — often a too-low CPU limit choking it every period. Visible in the cgroup's throttling metric. Remember: memory hits with a kill, CPU hits with delay.
-
-### Privileges: capabilities, seccomp, LSM
-
-The third group — three layers of defense:
-
-- **capabilities** — root's omnipotence split into ~40 separate rights granted one by one (binding to ports below 1024 is one; managing the network is another). Docker keeps a narrow safe set by default and drops the dangerous ones, so even root inside is heavily trimmed.
-- **seccomp** — a syscall filter: the default profile blocks dozens of dangerous and rare syscalls, narrowing the "doors" to the kernel and thus the attack surface.
-- **LSM (AppArmor / SELinux)** — Linux security modules. Unlike ordinary file permissions granted by an owner, these are a separate ruleset set centrally by the admin for the whole system; not even root inside can override them. The last line of defense once the first two layers are bypassed.
-
-The `--privileged` flag strips almost all of this at once — effectively "turn off security". Use it only when unavoidable and knowing what you open.
-
-## Block 1 summary
-
-- A container is an ordinary process on a shared kernel; no second OS inside.
-- namespaces give a private view: pid, net, mnt, user.
-- cgroups cap the appetite: memory hits with a kill (OOMKilled), CPU with delay (throttling).
-- Privileges tighten via three layers: capabilities, seccomp, LSM.
-- Engines (`docker`, `containerd`, `runc`) only configure the kernel.
+Файлы репозитория: `main.py`, `requirements.txt`, `Dockerfile`, `Dockerfile.multistage`, `mydocker.sh`, `seccomp_wrapper.py` (seccomp-профиль), `monitoring/` (cAdvisor + Prometheus + Grafana), `screenshots/`.
 
 ---
 
-## Block 2. Image and the runtime stack
+## Часть 1 -- запуск напрямую 
 
-### What an image really is
+Сервис запущен обычным процессом, PID 40022. `/health` отдаёт `ok` и в браузере, и через `curl`. В `ps aux` процесс виден как любой другой на хосте, под моим пользователем; Flask слушает все адреса, включая физический `192.168.0.246`.
 
-An image is not a zip archive or a whole-disk snapshot. Image = a set of layers (each describing filesystem changes) + metadata (a manifest — the table of contents, and a config — the run parameters). The format is standardized by the OCI (Open Container Initiative), so an image built by Docker runs fine under `containerd` or Podman. An image is immutable: once built it does not change; any edit makes a new image.
+![Запуск напрямую, PID](screenshots/01-direct-run-pid.png)
+![/health в браузере](screenshots/02-direct-health-browser.png)
+![ps aux на хосте](screenshots/03-direct-ps-host.png)
 
-### Layers and content addressing
-
-A layer is an archive of filesystem changes relative to the layer below; order matters. The `api` image bottom-up: base environment → dependencies → the `api` binary → metadata. Everything is addressed by a content hash — the digest (`sha256:3f2a...`). Three consequences:
-
-- **deduplication** — an identical layer is stored and pulled exactly once (a base layer is shared across many images; that is why on `pull` half the layers are "already present");
-- **immutability by math** — change a byte → different hash → different object;
-- **built-in integrity check** — download a layer, hash it, compare: a match means nothing was corrupted or swapped.
-
-### overlayfs: turning layers into a filesystem
-
-Layers are separate file sets, but the process needs one root. `overlayfs` builds it: it stacks directories and presents them as one. Image layers mount below as read-only; a thin writable layer, private to the container, sits on top; the merged result is what the container sees as its root — the one `pivot_root` switches to. Writes use copy-on-write: change a file from a lower read-only layer and it is first copied up into the writable layer, then edited there (so editing a large file from the base layer is costly).
-
-### The writable layer is ephemeral: data goes in volumes
-
-The thin writable layer lives exactly as long as the container. Delete the container, recreate the pod — whatever was written there is gone. So anything that must outlive the container (`postgres` data, uploaded files) goes into volumes, not the writable layer. A volume is separate storage mounted into the container; it is not part of the image and lives its own life. This is why a database must not run without a volume — the first restart wipes the data.
-
-### Tag vs digest
-
-An image has two kinds of reference. A **tag** (`api:1.4`, `api:latest`) is a human-readable label — convenient but treacherous: it can move to another image at any time (someone rebuilds and pushes under the same tag). `latest` is not "the newest version" but simply the default tag. A **digest** (`api@sha256:...`) is an immutable address of specific content that never moves. For production and reproducibility — in Kubernetes manifests — reference by digest (pinning): then you run exactly the image you verified.
-
-### Who starts the container: the runtime stack
-
-Between command and process is a chain with a division of labor:
-
-`docker (CLI) → dockerd → containerd → containerd-shim → runc → process`
-
-- **runc** — takes the unpacked image and container spec, does the Block 1 work (namespaces, cgroups, privileges, `pivot_root`, launch), and exits;
-- **shim** — stays to watch the running container;
-- **containerd** — a daemon that manages images and container lifecycle, calls runc;
-- **dockerd** — a convenient wrapper: CLI, builds, networks, volumes.
-
-### Why runc exits and why the shim exists
-
-runc does the low-level work and exits — it does not linger by the container. If `containerd` were the containers' direct parent, restarting it would sever the link: control, logs, exit codes (the containers would not die — the host's init would re-adopt them — but `containerd` would no longer be their parent). So a `containerd-shim` sits in between, a thin broker per container. It becomes the container process's lasting parent, holds its output streams (stdout/stderr) so logs are not lost, keeps the exit code, and — crucially — survives a `containerd` restart: containers keep running under their shims, and the restarted `containerd` simply reconnects to them and regains control. The point of the layer is to decouple the daemon's fate from the containers'.
-
-### The full docker run path
-
-You type `docker run api`. The `docker` client sends a request to the `dockerd` daemon. `dockerd` asks `containerd` to create a container. `containerd` assembles the root from layers via `overlayfs`, builds the container spec with all namespaces and limits, and starts a shim. The shim calls `runc`. `runc` creates namespaces/cgroups/privileges, does `pivot_root`, launches the `api` process — and exits. `api` keeps running under the shim.
-
-### Where Kubernetes fits: CRI
-
-Kubernetes knows nothing about Docker. Each node runs the kubelet agent, which talks to the runtime through the standard **CRI (Container Runtime Interface)** — a contract of "create a pod, start/stop a container, give status":
-
-`kubelet → CRI → containerd (or CRI-O) → shim → runc → process`
-
-There used to be a dockershim layer to Docker; Kubernetes 1.24 removed it. That is the "Kubernetes drops Docker" news: only the shim to the Docker daemon was removed, while the OCI image format, `containerd`, and `runc` stayed — images work as before. In practice, a modern cluster node runs `containerd`, and the Docker daemon is not needed there.
-
-## Block 2 summary
-
-- Image = layers (filesystem changes) + manifest + config, all addressed by hash (dedup and integrity).
-- `overlayfs` builds the root: read-only layers below + a thin writable layer on top, copy-on-write; the writable layer is ephemeral → data goes in volumes.
-- Launch runs the `dockerd → containerd → shim → runc → process` stack; at the bottom runc does the Block 1 work.
-- Kubernetes uses the same bottom via CRI, with no Docker daemon.
+Изоляции нет: процесс видит всю систему, всю сеть хоста и может занять любое количество памяти и CPU.
 
 ---
 
-## Block 3. Building, delivering, and boundaries
+## Часть 2 -- namespaces
 
-### Building an image: from the old builder to BuildKit
+Команда (от обычного пользователя, без sudo):
 
-The classic `docker build` ran Dockerfile instructions strictly in order, and almost each produced a layer. The cache was linear: while a line and its context were unchanged the layer came from cache, but from the first changed line the whole tail below was rebuilt. Hence the optimization rule: rarely changing things (installing dependencies) go higher, frequently changing things (copying code) go lower; then the heavy layers come from cache and only a light tail rebuilds. Modern **BuildKit** (now the Docker default) is smarter: it reads the Dockerfile as a dependency graph, runs independent steps in parallel, caches more precisely, and — importantly for security — mounts secrets (e.g. a token for a private dependency) only for the duration of a step so they never end up in image layers.
+```bash
+unshare --user --map-root-user --pid --fork --mount-proc --mount --net --uts --ipc bash
+```
 
-### Multi-stage and a thin image
+Внутри:
 
-A multi-stage build has several stages in one Dockerfile. The build stage holds the full environment (compiler, dependencies) and produces the `api` binary. The final stage starts from a minimal base and copies in only the finished binary — nothing heavy from the build stage reaches it, since the final image takes only what is explicitly copied. Result for `api`: instead of hundreds of MB with a toolchain, single or tens of MB. Smaller image → faster pull → faster pod startup on rollout and scaling; and less clutter → smaller attack surface and fewer foreign vulnerabilities. For the minimal base, distroless (no package manager or shell) or empty scratch is common.
+![/health изнутри namespace](screenshots/05-namespaces-health.png)
 
-### Delivery: registry and pull
+Что показал шаг:
 
-A registry stores and serves images: Docker Hub, GitHub Container Registry, self-hosted Harbor, cloud registries. `docker pull` step by step:
+- `ps aux` внутри: `bash` -- PID 1, затем только `ps` и `python3 main.py` (PID 187). Процессов хоста нет.
+- `hostname` внутри -- `mydocker` (после `hostname mydocker`), снаружи имя хоста `NB-8767` не менялось.
+- `ip a` -- только `lo`, причём `DOWN`: сеть пустая, пришлось поднять `ip link set lo up`. Flask внутри слушает только `127.0.0.1:8080`, тогда как при запуске напрямую он видел ещё и `192.168.0.246`.
+- `id` -- `uid=0(root)`, но это root только внутри user namespace: на хосте процесс принадлежит обычному пользователю.
+- `curl localhost:8080/health` изнутри возвращает `ok` (`GET /health 200`).
 
-1. fetch the manifest (the image's table of contents);
-2. read the list of layers with their hashes;
-3. per layer: if the hash is already local, skip; otherwise download;
-4. verify each downloaded layer's hash, assemble the image.
+Что изолирует каждый namespace:
 
-So similar images pull fast — only what is missing is downloaded. `push` is the mirror image: the manifest and missing layers are uploaded, while anything already present by hash is not re-uploaded.
-
-### Where isolation leaks
-
-The container boundary is thinner than a VM's:
-
-- **shared kernel** — a host-kernel vulnerability is in principle reachable from any container (unlike VMs with separate kernels);
-- **not everything is namespaced** — parts of `/proc`, `/sys`, and some kernel parameters are visible or influential across the boundary (that is why seccomp and LSM are needed — to cover what namespaces do not isolate);
-- **root without a user namespace = root on the host** on escape.
-
-The conclusion is not "containers are insecure" but more precise: an ordinary container isolates your own, trusted code excellently. For foreign, untrusted code (building others' artifacts, letting users run their own code) the ordinary boundary may not be enough.
-
-### When an ordinary container is not enough: hardened runtimes
-
-Every solution shares one idea — give the container something like its own kernel so it does not go straight to the host kernel:
-
-- **gVisor** — intercepts the container's syscalls and handles them in its own mini-kernel in user space, keeping dangerous calls away from the host kernel;
-- **Kata Containers** — runs the container inside a very lightweight VM (literally its own kernel — real isolation, but overhead closer to a VM);
-- **rootless containers** — the whole stack runs without root on the host, resting on the user namespace.
-
-The trade-off is simple: stronger isolation means higher overhead. Choose by task: your own code usually needs only an ordinary container; untrusted code gets a hardened runtime.
-
-### Trusting an image: signature and provenance
-
-A hash (digest) gives integrity (the content is exactly what is claimed) but does not answer trust — who built the image. So on top of the image you add:
-
-- **image signature** (e.g. `cosign`) — cryptographically confirms who built it and that it was not tampered with in transit;
-- **provenance** — origin details: which repository, which pipeline, which commit;
-- **SBOM** (software bill of materials) — a list of what is inside (packages and versions), so a new high-profile vulnerability can be checked against the image in a minute.
-
-Signatures and the supply chain are covered in the security lectures.
-
-## Block 3 summary
-
-- BuildKit builds by graph with precise caching and secrets kept out of layers; multi-stage + a minimal base give a thin image.
-- Delivery goes through a registry; `pull` downloads only what is missing, by hash.
-- The isolation boundary is thinner than a VM's because the kernel is shared; for untrusted code strengthen it with gVisor, Kata, or rootless.
-- A hash gives integrity; trust comes from a signature and provenance.
+| Флаг | Namespace | Что изолирует |
+|---|---|---|
+| `--pid --fork --mount-proc` | PID | собственная нумерация процессов, процесс -- PID 1, чужие процессы не видны; `/proc` перемонтирован, иначе `ps` показывал бы хостовые |
+| `--mount` | Mount | собственная таблица монтирования; перемонтирование `/proc` не влияет на хост |
+| `--net` | Network | свой сетевой стек: интерфейсы, маршруты, порты; изначально только `lo` |
+| `--uts` | UTS | своё имя хоста и домена |
+| `--ipc` | IPC | свои очереди сообщений, семафоры, shared memory |
+| `--user --map-root-user` | User | uid 0 внутри соответствует непривилегированному uid снаружи: «root» без реальных прав на хосте |
 
 ---
 
-## Summary
+## Часть 3 -- cgroups v2
 
-- A container is an ordinary process on a shared kernel: namespaces (what it sees) + cgroups (how much it may use) + privileges (what it may do).
-- Memory hits with a kill (`OOMKilled`), CPU with delay (throttling).
-- An image is layers + metadata, all by hash; `overlayfs` builds the root; data lives in volumes.
-- Launch: `dockerd → containerd → shim → runc → process`; Kubernetes reaches the same bottom via CRI.
-- Building with BuildKit + multi-stage; delivery via a registry; isolation is real but thinner than a VM's due to the shared kernel.
-- Next — how to observe all this: metrics, logs and traces (the next lecture), then orchestration — Kubernetes and its control plane.
+Создана cgroup `/sys/fs/cgroup/mydocker`. Процесс помещается в неё командой, которая записывает свой PID в `cgroup.procs` и делает `exec`, поэтому дочерние процессы автоматически внутри:
 
-> Lab: build a container by hand and keep a service within limits — see [lab.md](lab.md).
+```bash
+sudo sh -c 'echo $$ > /sys/fs/cgroup/mydocker/cgroup.procs && exec "$@"' sh .venv/bin/python main.py
+```
+
+### Память и OOM
+
+Лимиты: `memory.max = 100M`, `memory.swap.max = 0` (без свопа, иначе OOM не сработает).
+
+![Настройка лимита памяти](screenshots/06-cgroup-memory-setup.png)
+![/eat за лимит](screenshots/07-oom-eat-curl.png)
+![memory.events](screenshots/08-oom-memory-events.png)
+
+- `/eat?mb=60` -- проходит (`allocated 60 MB`).
+- `/eat?mb=200` -- выше лимита: `curl: (52) Empty reply from server`, процесс убит.
+- `memory.events`: `oom 1`, `oom_kill 1`, `max 41` (cgroup 41 раз упиралась в потолок и вытесняла память, прежде чем ядро убило процесс).
+
+Это то же самое, что `OOMKilled` в Kubernetes: ядро убивает процесс, когда cgroup не может уложиться в `memory.max`.
+
+### CPU и throttling
+
+Лимит: `cpu.max` -- пол-ядра (50 мс из каждых 100 мс). Нагрузка -- `curl localhost:8080/burn`.
+
+![cpu.stat](screenshots/09-cpu-stat-throttling.png)
+![htop](screenshots/10-htop-cpu-limit.png)
+
+- `cpu.stat`: `nr_periods 2218`, `nr_throttled 2187` (≈99% периодов), `throttled_usec 109404572` (≈109 с принудительного простоя).
+- В `htop` процесс `python main.py` держится на 51% CPU, хотя цикл без лимита занял бы 100% ядра.
+
+### Процессы (pids.max) и форк-бомба
+
+Лимит: `pids.max = 20`. Нагрузка: `stress-ng --fork 10 --timeout 15s` внутри cgroup.
+
+![pids.max](screenshots/11-pids-max-set.png)
+![stress-ng --fork](screenshots/12-stress-ng-fork.png)
+![pids.events](screenshots/13-pids-events.png)
+
+`stress-ng` считает отказ `fork()` штатной ситуацией, поэтому пишет `failed: 0` и успешно завершается. Доказательство, что расплодиться не дали, -- счётчик `max` в `pids.events`: 43 → 47 (столько попыток `fork` ядро отклонило), а `pids.current` остаётся в пределах 15–16. Система при этом осталась живой.
+
+---
+
+## Часть 4 -- права
+
+### Capabilities
+
+Привилегированное действие -- смена системного времени (нужна `CAP_SYS_TIME`):
+
+```bash
+sudo capsh --drop=cap_sys_time -- -c 'date -s "$(date)"; echo rc=$?'
+# date: cannot set date: Operation not permitted
+# rc=1
+```
+
+Для самого сервиса оставлен нулевой набор прав (порту 8080 привилегии не нужны):
+
+```bash
+sudo setpriv --reuid=$(id -u) --regid=$(id -g) --clear-groups \
+  --bounding-set=-all --inh-caps=-all --ambient-caps=-all --no-new-privs \
+  .venv/bin/python main.py
+```
+
+![Сброс capabilities](screenshots/14-capabilities-drop.png)
+![Сервис без capabilities отвечает](screenshots/15-setpriv-service.png)
+
+В `/proc/<PID>/status` все поля `CapInh/CapPrm/CapEff/CapBnd/CapAmb` равны `0000000000000000`, при этом `/health` отвечает `200`: сервису для работы привилегии не нужны.
+
+### seccomp
+
+Профиль -- `seccomp_wrapper.py`: ставит фильтр (по умолчанию всё разрешено, но `mkdir`, `mkdirat`, `settimeofday`, `clock_settime`, `reboot`, `kexec_load` возвращают `EPERM`) и затем делает `exec` целевой команды.
+
+![Разрешённые вызовы работают](screenshots/17-seccomp-ls-allowed.png)
+
+`python3 seccomp_wrapper.py mkdir /tmp/blocked` → `Operation not permitted`, а `ls main.py` под тем же фильтром работает.
+
+### Что закрывает каждый механизм
+
+- Capabilities делят всемогущество root на ~40 отдельных привилегий (менять время, монтировать, открывать raw-сокеты, загружать модули ядра и т.д.). Закрывают вопрос «*что* процессу разрешено делать». Вместе с `no_new_privs` процесс не получит привилегии обратно через setuid-бинарники.
+- seccomp -- фильтр системных вызовов на входе в ядро. Закрывает вопрос «*какие* вызовы ядра доступны». Работает независимо от capabilities и сокращает поверхность атаки на ядро: уязвимый или ненужный syscall просто недостижим.
+- namespaces (часть 2) ограничивают, *что процесс видит*; cgroups (часть 3) -- *сколько ресурсов он может взять*.
+
+---
+
+## Часть 5 -- свой Docker (`mydocker.sh`)
+
+`mydocker.sh` собирает всё из частей 2–4 в одну команду:
+
+1. под root создаёт cgroup `/sys/fs/cgroup/mydocker` и задаёт `memory.max`, `memory.swap.max=0`, `cpu.max` (0.5 ядра), `pids.max`;
+2. помещает сам себя в cgroup и сбрасывает uid в обычного пользователя (`setpriv --reuid`);
+3. запускает `unshare --user --map-root-user --pid --fork --mount-proc --mount --net --uts --ipc`;
+4. внутри задаёт hostname, поднимает `lo`, сбрасывает все capabilities (`setpriv --bounding-set=-all ... --no-new-privs`) и запускает сервис через `seccomp_wrapper.py`.
+
+Запуск одной командой `./mydocker.sh`:
+
+![Работающий mydocker.sh](screenshots/23-mydocker-sh.png)
+
+Сервис поднялся, в логе видно `GET /health 200`. Flask слушает только `127.0.0.1` (внутри пустого сетевого namespace нет ни физического интерфейса, ни моста), поэтому с хоста `/health` проверяется из сетевого namespace процесса: `sudo nsenter -t <PID> -n curl localhost:8080/health`.
+
+### Тот же сервис через `docker run`
+
+```bash
+docker run --rm -p 8081:8080 --memory=100m --memory-swap=100m --cpus=0.5 --pids-limit=50 \
+  --cap-drop=ALL --security-opt no-new-privileges mydocker-api:single
+```
+
+![docker run с лимитами](screenshots/18-docker-run-limits.png)
+![/health контейнера](screenshots/19-docker-health.png)
+
+Сервис поднялся, `/health` отвечает. Сеть уже другая: у контейнера адрес `172.17.0.2` в мосту `docker0` и проброшенный порт (`-p 8081:8080`), тогда как у моего скрипта -- пустой namespace с одним `lo`.
+
+### Сравнение
+
+| | `mydocker.sh` | `docker run` |
+|---|---|---|
+| Namespaces | pid, mnt, net, uts, ipc, user | те же + cgroup namespace; user namespace по умолчанию выключен |
+| Лимиты cgroup | вручную через `/sys/fs/cgroup` | флаги `--memory`, `--cpus`, `--pids-limit`; cgroup создаёт демон |
+| Capabilities | сброшены все | по умолчанию урезанный набор (~14 из ~40), `--cap-drop/--cap-add` |
+| seccomp | свой маленький deny-лист (6 syscalls) | встроенный профиль по умолчанию, блокирует десятки опасных вызовов |
+| LSM (AppArmor/SELinux) | нет | профиль `docker-default` |
+| Файловая система | хостовая (тот же `/`, venv хоста) | отдельный rootfs из слоёв образа, overlayfs, copy-on-write |
+| Сеть | пустая, только `lo` (veth руками) | bridge `docker0`, NAT, DNS, проброс портов |
+| Образы и слои | нет | `build/pull/push`, кэш слоёв, реестр |
+| Тома, секреты | нет | volumes, bind mounts, secrets |
+| Жизненный цикл | один процесс на переднем плане | демон, restart-политики, healthcheck, логи, `exec`, `stats` |
+| Masked paths (`/proc/kcore` и т.п.) | нет | да |
+
+- Совпадает: ядерные примитивы те же -- namespaces, cgroups v2, capabilities, seccomp. Docker -- это не новая технология изоляции, а их автоматизация.
+- Чего нет в скрипте: собственной файловой системы (процесс видит весь хост), сети (нет моста, NAT, DNS), AppArmor, масок `/proc`, образов, управления жизненным циклом.
+- Что Docker делает сверх: образы и слои с кэшированием, rootfs через overlayfs, сеть и проброс портов, тома, профили безопасности по умолчанию, демон с политиками перезапуска и наблюдаемостью.
+
+---
+
+## Часть 6 -- образы
+
+`Dockerfile` -- одностадийная сборка на `python:3.11-slim-bookworm`. `Dockerfile.multistage` -- зависимости ставятся в стадии builder (`pip install --target=/deps`), в финальный образ копируется только `/deps` и `main.py`.
+
+![docker images, history, слои](screenshots/20-images-history-layers.png)
+
+| Образ | Размер на диске | Размер содержимого | Слоёв |
+|---|---|---|---|
+| `mydocker-api:single` | 231 MB | 55.7 MB | 8 |
+| `mydocker-api:multi` | 215 MB | 51.6 MB | 7 |
+
+Разница небольшая, экономится только слой `pip install` против копирования готовых зависимостей.
+
+### Кэш при повторной сборке
+
+После `echo "# touch" >> main.py` и пересборки:
+
+![Сборка с кэшем](screenshots/21-build-cache.png)
+
+- `Using cache`: `FROM`, `WORKDIR`, `COPY requirements.txt`, `pip install` (самый дорогой шаг), `COPY --from=builder`;
+- пересобираются только шаги, начиная с `COPY main.py` -- первого слоя, где изменилось содержимое; последующие слои (`ENV`, `EXPOSE`, `CMD`) идут заново, поскольку кэш инвалидируется для всех шагов после изменённого.
+
+Поэтому в Dockerfile `requirements.txt` копируется и устанавливается до `COPY main.py`: правка кода не заставляет заново ставить зависимости.
+
+### Данные в контейнере и том
+
+![Файл без тома и с томом](screenshots/24-volume-demo.png)
+
+- Без тома: файл записан в `/app/marker.txt` внутри контейнера `t1`, контейнер удалён (`docker rm t1`), новый контейнер из того же образа → `cat: /app/marker.txt: No such file or directory`. Файл пропал.
+- С томом `mydocker-data`, смонтированным в `/data`: файл записан одним контейнером, а новый контейнер (после `--rm` прежнего) читает `hello`. Файл остался.
+
+Объяснение: запись идёт в тонкий записываемый слой overlayfs, который удаляется вместе с контейнером; том -- каталог на хосте (`/var/lib/docker/volumes/...`), не привязанный к жизни контейнера.
+
+---
+
+## Часть 7 -- gVisor
+
+Как устроен gVisor. Между приложением и ядром хоста стоит Sentry -- «ядро» в пользовательском пространстве, которое само 
+реализует системные вызовы, сетевой стек и часть файловой логики; работу с файлами делегирует отдельному процессу Gofer. Системный вызов приложения перехватывается Sentry; к настоящему ядру хоста Sentry обращается лишь узким набором вызовов, жёстко отфильтрованным seccomp. У обычного контейнера (runc) приложение обращается к ядру хоста напрямую -- с ограничениями seccomp/capabilities, но тем же ядром.
+
+Почему считается более изолированным. Уязвимость в ядре через редкий syscall, драйвер или файловую систему из контейнера недостижима: сначала нужно скомпрометировать Sentry, а затем пройти узкий seccomp-коридор к хосту. Поверхность атаки на ядро хоста сокращается с сотен системных вызовов до нескольких десятков. Цена -- накладные расходы на перехват syscalls (особенно I/O и сеть) и неполная совместимость.
+
+Сравнение трёх вариантов:
+
+| | `mydocker.sh` | обычный Docker (runc) | gVisor (runsc) |
+|---|---|---|---|
+| Ядро, к которому идут syscalls | ядро хоста | ядро хоста | Sentry (userspace), к хосту -- минимум |
+| Фильтр syscalls | свой маленький seccomp | seccomp по умолчанию | сам Sentry + seccomp на Sentry |
+| Файловая система | хостовая | слои образа | слои образа через Gofer |
+| Поверхность атаки на ядро хоста | широкая | широкая (урезана seccomp) | узкая |
+| Накладные расходы | нет | минимальные | заметные (I/O, сеть) |
+
+Что у обычного контейнера остаётся общим с хостом в любом случае -- ядро. Один и тот же код ядра обслуживает и хост, и все 
+контейнеры; namespaces и cgroups -- лишь таблицы видимости и учёта внутри этого ядра, а не отдельные машины. Поэтому уязвимость 
+ядра (побег из контейнера), общий планировщик и кэши процессора (побочные каналы вроде Spectre/Meltdown), а также ресурсы без namespace (системные часы, ключи ядра, модули ядра) затрагивают все контейнеры сразу. Это предел контейнерной изоляции: чтобы выйти за него, нужно отдельное ядро на нагрузку -- пользовательское (gVisor), микро-VM (Kata, Firecracker) или полноценная VM.
+
+---
+
+## Часть 8 -- мониторинг
+
+Стек из [monitoring/](monitoring/): cAdvisor читает cgroup контейнеров, Prometheus каждые 5 секунд забирает метрики у cAdvisor, Grafana строит дашборд. Запуск: `cd monitoring && docker compose up -d`. Grafana подключена к `http://prometheus:9090`.
+
+Дашборд: память в % от лимита, CPU в ядрах, throttling в % периодов под нагрузкой (`/eat` и `/burn` на контейнере с `--memory` и `--cpus=0.5`):
+
+![Дашборд под нагрузкой](screenshots/25-grafana-under-load.png)
+
+- Память: рост с ≈14% до ≈54%, затем разрыв ряда (OOM) и повторный рост до ≈99% лимита.
+- CPU: потребление `api-load` поднимается к 0.5 ядра (к заданному лимиту).
+- Throttling: подскакивает с 0% до ≈100% периодов и держится там. Один бесконечный цикл хочет целое ядро, а получает 0.5, поэтому упирается в квоту в каждом периоде. Совпадает с `cpu.stat` из части 3 (`nr_throttled` ≈ 99% от `nr_periods`).
+
+### Три метрики под алерты
+
+Правила лежат в [monitoring/alerts.yml](monitoring/alerts.yml).
+
+1. Память к лимиту > 90% (`working_set / spec_memory_limit`). Ловит приближение к `memory.max` до того, как придёт OOM. Если пропустить -- ядро убьёт процесс (`OOMKilled`), запросы оборвутся, состояние в памяти потеряется, начнётся цикл перезапусков. Именно `working set`, а не `usage`: он не включает неактивный page cache, и по нему принимается решение об OOM.
+2. Доля throttled-периодов CPU > 25% (`cfs_throttled_periods / cfs_periods`). Ловит, что лимит CPU мал для нагрузки: контейнер не падает, но «замораживается» в конце каждого периода (в части 3 было ≈99% периодов). Грозит ростом латентности (p99), таймаутами и каскадными отказами при формально «здоровом» сервисе -- самый коварный сбой, потому что нет ни ошибок, ни перезапусков.
+3. Рост `container_oom_events_total`. Ловит уже свершившееся убийство процесса по памяти -- прямой признак неверного лимита или утечки. Грозит нестабильностью и потерей запросов; в отличие от п.1 это факт, а не прогноз.
+
