@@ -1,0 +1,54 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: api-alerts
+  namespace: monitoring
+  labels:
+    release: prometheus-operator
+spec:
+  groups:
+    - name: api.critical
+      rules:
+        - alert: ApiHighErrorRate
+          expr: |
+            (
+              sum(rate(http_requests_total{status=~"5.."}[5m]))
+              /
+              sum(rate(http_requests_total[5m]))
+            ) > 0.05
+          for: 5m
+          labels:
+            severity: critical
+            service: api
+          annotations:
+            summary: "API: высокая доля ошибок"
+            description: "Более 5% запросов завершаются HTTP 5xx в течение 5 минут"
+
+        - alert: ApiHighP95Latency
+          expr: |
+            histogram_quantile(
+              0.95,
+              sum by (le) (
+                rate(http_request_duration_seconds_bucket[5m])
+              )
+            ) > 1
+          for: 5m
+          labels:
+            severity: critical
+            service: api
+          annotations:
+            summary: "API: p95 времени ответа выше 1 секунды"
+            description: "95-й перцентиль задержки превышает 1 секунду в течение 5 минут"
+
+        - alert: ApiUnavailable
+          expr: |
+            absent(up{namespace="default", service="api"})
+            or
+            min(up{namespace="default", service="api"}) == 0
+          for: 1m
+          labels:
+            severity: critical
+            service: api
+          annotations:
+            summary: "API недоступен для Prometheus"
+            description: "Цель API отсутствует среди scrape-целей или метрики не собираются"
