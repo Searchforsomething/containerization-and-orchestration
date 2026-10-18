@@ -1,0 +1,478 @@
+{
+  "name": "My workflow",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "api-docs-update",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.2,
+      "position": [
+        -384,
+        16
+      ],
+      "id": "ea66ef7e-3fa5-4bdc-b40d-83daeb913bdd",
+      "name": "Webhook",
+      "webhookId": "62d6cba3-fa25-44dd-8d00-11912f4a303c"
+    },
+    {
+      "parameters": {
+        "model": "carstenuhlig/omnicoder-9b:latest",
+        "options": {
+          "format": "default"
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatOllama",
+      "typeVersion": 1,
+      "position": [
+        448,
+        192
+      ],
+      "id": "6fbcdb82-54f1-467b-9ec4-6f980f781b13",
+      "name": "Ollama Chat Model",
+      "credentials": {
+        "ollamaApi": {
+          "id": "rYQoMqw1GKe6jdu3",
+          "name": "Ollama account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=={{ JSON.stringify(($json.stdout ?? \"\") + \"\\n\\n\" + ($json.docs ?? \"\")) }}",
+        "options": {
+          "systemMessage": "=You are an AI agent responsible for keeping API documentation synchronized with source code changes.\n\n## Agent Skill\n\nFollow the workflow and rules defined in the skill below. The skill is part of your operational instructions and must be applied to this task.\n\n### Loaded skill\n\n{{ $json.skill }}\n\nIf the skill content is empty or unavailable, do not claim to have loaded it. Follow the remaining requirements in this System Message and report the missing skill in `unverified_information`.\n\n## Task context\n\nThe task is triggered by a webhook. The repository name, branch, commit identifier, and commit message are supplied by the workflow.\n\nSource repository: `/workspace/{{ $('Webhook').first().json.body.repository }}`\n\nDocumentation repository: `/workspace/docs`\n\nTarget documentation file: `{{ $('Webhook').first().json.body.repository }}/README.md`, relative to `/workspace/docs`.\n\nAlways use the repository name supplied by the webhook. Do not hard-code `api` as the only possible repository.\n\n## Required MCP tool usage\n\nBefore generating the final response, actually invoke the available MCP tools and use their results.\n\n1. Use `list_directory` to inspect the source repository and documentation structure.\n2. Use `git_log` to inspect relevant commit history.\n3. Use `git_show` to inspect the relevant commit when supported.\n4. Use `git_diff` to inspect source code changes.\n5. Use `read_text_file` to read the existing README and relevant source files.\n\nUse the Git MCP server configured for the source repository to inspect source changes. Use the Git MCP server configured for `/workspace/docs` when documentation history needs to be inspected.\n\nDo not assume one Git MCP server can access both repositories. Prefer the commit identifier supplied by the webhook when the tools support it. Do not assume that the webhook commit and the latest `HEAD` are identical.\n\nIf a tool fails or information cannot be accessed, proceed only with verifiable information and report relevant limitations in `unverified_information`.\n\n## Documentation requirements\n\n- Generate documentation in Russian.\n- Verify documented API behavior against the actual source code.\n- Do not invent endpoints, HTTP methods, parameters, request or response fields, status codes, examples, or behavior.\n- Read the existing README before preparing changes.\n- Preserve unrelated sections and existing documentation structure.\n- Update only documentation affected by the source code changes.\n- Return the complete updated contents of each changed documentation file.\n- If no documentation update is necessary, return an empty `changes` array and explain why in `summary`.\n- Do not modify files or create Git commits through MCP tools. The downstream workflow handles writing files and committing changes.\n\n## Required output format\n\nReturn exactly one valid JSON object:\n\n{\n  \"summary\": \"Brief summary of the documentation update\",\n  \"changes\": [\n    {\n      \"file_path\": \"{{ $('Webhook').first().json.body.repository }}/README.md\",\n      \"content\": \"Complete updated README content in Russian\",\n      \"reason\": \"Why this documentation file needs to be updated\"\n    }\n  ],\n  \"unverified_information\": []\n}\n\n## Output rules\n\n- `summary` must be a string.\n- `changes` must be an array of objects, not an array of strings.\n- Every object in `changes` must contain `file_path`, `content`, and `reason`, all as strings.\n- `file_path` must be relative to `/workspace/docs` and must match the repository supplied by the webhook.\n- `content` must contain the complete updated file, not a diff or partial excerpt.\n- `reason` must explain why the file needs updating.\n- `unverified_information` must be an array of strings. Use an empty array if all relevant facts have been verified.\n- Ensure that the response is valid JSON, with quotation marks, backslashes, and newline characters escaped correctly.\n- Do not include Markdown code fences, comments, or any text outside the JSON object.\n\n## Final verification\n\nBefore returning the response:\n\n1. Confirm that the skill was loaded and followed, or report its unavailability.\n2. Confirm that the MCP tools were actually called and their results used.\n3. Verify the documentation against the inspected source code.\n4. Confirm that unrelated documentation has been preserved.\n5. Validate the JSON structure and repository-relative file path.\n\nReturn only the required JSON object.",
+          "forceToolCallOnFirstIteration": true
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 3.1,
+      "position": [
+        448,
+        0
+      ],
+      "id": "a36ab80c-e31f-49a2-894d-cd959e549766",
+      "name": "AI Agent",
+      "executeOnce": false,
+      "retryOnFail": false,
+      "alwaysOutputData": false
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "combineBy": "combineByPosition",
+        "numberInputs": 3,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        256,
+        0
+      ],
+      "id": "e7933fad-a0b1-4340-bfea-1691e1ce2457",
+      "name": "Merge"
+    },
+    {
+      "parameters": {
+        "executeOnce": false,
+        "command": "=git -c safe.directory=/workspace/{{ $json.body.repository }} \\\n  -C /workspace/{{ $json.body.repository }} \\\n  show --format='COMMIT: %H%nMESSAGE: %s' --no-ext-diff HEAD"
+      },
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        32,
+        -160
+      ],
+      "id": "e09a19fd-fcfd-408d-b6ae-b583230c57a5",
+      "name": "Git Diff"
+    },
+    {
+      "parameters": {
+        "jsCode": "const output = $input.first().json.output;\n\nlet result;\n\ntry {\n  result = typeof output === 'string' ? JSON.parse(output) : output;\n} catch (error) {\n  throw new Error(`AI Agent returned invalid JSON: ${error.message}`);\n}\n\nif (!result || !Array.isArray(result.changes)) {\n  throw new Error('AI Agent output must contain a changes array');\n}\n\nfor (const change of result.changes) {\n  if (typeof change.content !== 'string') {\n    throw new Error(`Missing content for ${change.file_path}`);\n  }\n}\n\nreturn result.changes.map(change => ({\n  json: {\n    file_path: `/workspace/docs/${change.file_path}`,\n    content: change.content,\n    reason: change.reason\n  }\n}));\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        768,
+        0
+      ],
+      "id": "c75ad6c4-55f9-4be8-9e89-5bf0d94e3ec9",
+      "name": "Validation + formatting"
+    },
+    {
+      "parameters": {
+        "operation": "toText",
+        "sourceProperty": "content",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.convertToFile",
+      "typeVersion": 1.1,
+      "position": [
+        944,
+        160
+      ],
+      "id": "e3415970-4d08-4de1-b7f8-3e33ced3faa8",
+      "name": "Coding to file",
+      "notesInFlow": false,
+      "alwaysOutputData": false
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "combineBy": "combineByPosition",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        1136,
+        16
+      ],
+      "id": "4e4f111f-5feb-491c-a3a8-55129a92bb62",
+      "name": "Merge1"
+    },
+    {
+      "parameters": {
+        "operation": "write",
+        "fileName": "={{ $json.file_path }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.readWriteFile",
+      "typeVersion": 1.1,
+      "position": [
+        1344,
+        16
+      ],
+      "id": "52ef1a93-81ef-4af4-932d-0bcbb403ff58",
+      "name": "Write documentation"
+    },
+    {
+      "parameters": {
+        "command": "git config --global --add safe.directory /workspace/docs &&\ngit -C /workspace/docs add api/README.md &&\nif ! git -C /workspace/docs diff --cached --quiet; then\n  git -C /workspace/docs -c user.name=\"n8n Bot\" -c user.email=\"n8n-bot@localhost\" commit -m \"docs: update documentation\"\nelse\n  echo \"No documentation changes to commit\"\nfi"
+      },
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        1568,
+        16
+      ],
+      "id": "2f192da1-ff46-4fad-a16d-4e3f29d41682",
+      "name": "Commit changes"
+    },
+    {
+      "parameters": {
+        "executeOnce": false,
+        "command": "cat /workspace/SKILL.md"
+      },
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        -80,
+        192
+      ],
+      "id": "49b3b642-0df0-4df5-96c2-afbeac737255",
+      "name": "SKILL",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "executeOnce": false,
+        "command": "=cat /workspace/docs/{{$json.body.repository}}/README.md"
+      },
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [
+        -112,
+        16
+      ],
+      "id": "5d662be6-bd42-4e52-9121-24e992b24ea2",
+      "name": "Current documentation",
+      "notesInFlow": false
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "f6633163-5fd1-4c58-96cc-e8b0b7c22620",
+              "name": "skill",
+              "value": "={{ $json.stdout }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.5,
+      "position": [
+        64,
+        192
+      ],
+      "id": "3a28f727-e5df-4a38-9163-c94c799dcd00",
+      "name": "Set Skill"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "f6633163-5fd1-4c58-96cc-e8b0b7c22620",
+              "name": "docs",
+              "value": "={{ $json.stdout }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.5,
+      "position": [
+        64,
+        16
+      ],
+      "id": "7406e781-ec53-4833-a4e5-9a7384db2e10",
+      "name": "Set documentation"
+    },
+    {
+      "parameters": {
+        "endpointUrl": "http://mcp-filesystem:8000/mcp",
+        "include": "selected",
+        "includeTools": [
+          "read_text_file",
+          "list_directory"
+        ],
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.mcpClientTool",
+      "typeVersion": 1.4,
+      "position": [
+        560,
+        288
+      ],
+      "id": "10eefc17-d022-45e4-882b-31aaefa620fb",
+      "name": "mcp-filesystem"
+    },
+    {
+      "parameters": {
+        "endpointUrl": "http://mcp-git:8000/mcp",
+        "include": "selected",
+        "includeTools": [
+          "git_diff",
+          "git_log",
+          "git_show"
+        ],
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.mcpClientTool",
+      "typeVersion": 1.4,
+      "position": [
+        688,
+        288
+      ],
+      "id": "6e0029a0-bde9-491a-aed8-9a79621f32e3",
+      "name": "mcp-git"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Ollama Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Git Diff",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "SKILL",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Current documentation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge": {
+      "main": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Agent": {
+      "main": [
+        [
+          {
+            "node": "Validation + formatting",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Git Diff": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validation + formatting": {
+      "main": [
+        [
+          {
+            "node": "Coding to file",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Merge1",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Coding to file": {
+      "main": [
+        [
+          {
+            "node": "Merge1",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Merge1": {
+      "main": [
+        [
+          {
+            "node": "Write documentation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Write documentation": {
+      "main": [
+        [
+          {
+            "node": "Commit changes",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "SKILL": {
+      "main": [
+        [
+          {
+            "node": "Set Skill",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Current documentation": {
+      "main": [
+        [
+          {
+            "node": "Set documentation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Set Skill": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 2
+          }
+        ]
+      ]
+    },
+    "Set documentation": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "mcp-filesystem": {
+      "ai_tool": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "mcp-git": {
+      "ai_tool": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "46015a05-6627-4286-924e-3eb98a35c1bc",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "db70f2471c8ebc1ab69fa6763ec9684489cce0ded890650a726be727b4a7baa6"
+  },
+  "nodeGroups": [],
+  "id": "YjCJbzzX20zpJoAK",
+  "tags": []
+}

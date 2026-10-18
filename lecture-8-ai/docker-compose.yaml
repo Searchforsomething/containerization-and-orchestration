@@ -1,0 +1,111 @@
+services:
+  n8n:
+    image: docker.n8n.io/n8nio/n8n:latest
+    container_name: n8n
+    ports:
+      - "5678:5678"
+    environment:
+      - TZ=Europe/Moscow
+      - GENERIC_TIMEZONE=Europe/Moscow
+      - N8N_ENABLE_EXECUTE_COMMAND=true
+      - NODES_EXCLUDE=[]
+      - N8N_RESTRICT_FILE_ACCESS_TO=/workspace
+      - N8N_METRICS=true
+    volumes:
+      - n8n_data:/home/node/.n8n
+      - .:/workspace
+    networks:
+      - mcp-filesystem
+      - mcp-git
+      - monitoring
+    restart: unless-stopped
+
+  mcp-filesystem:
+    image: supercorp/supergateway
+    command:
+      - --stdio
+      - npx
+      - -y
+      - "@modelcontextprotocol/server-filesystem"
+      - /workspace
+      - --outputTransport
+      - streamableHttp
+      - --port
+      - "8000"
+      - --host
+      - 0.0.0.0
+    volumes:
+      - .:/workspace
+    expose:
+      - "8000"
+    networks:
+      - mcp-filesystem
+    restart: unless-stopped
+
+  mcp-git:
+    build:
+      context: .
+      dockerfile: Dockerfile.mcp
+    command:
+      - --stdio
+      - uvx
+      - mcp-server-git
+      - --repository
+      - /workspace/api
+      - --outputTransport
+      - streamableHttp
+      - --port
+      - "8000"
+      - --host
+      - 0.0.0.0
+    volumes:
+      - .:/workspace
+    expose:
+      - "8000"
+    networks:
+      - mcp-git
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yaml:/etc/prometheus/prometheus.yaml:ro
+      - prometheus_data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yaml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=7d
+    networks:
+      - monitoring
+    depends_on:
+      - n8n
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
+    volumes:
+      - grafana_data:/var/lib/grafana
+    networks:
+      - monitoring
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+volumes:
+  n8n_data:
+  prometheus_data:
+  grafana_data:
+
+networks:
+  mcp-filesystem:
+  mcp-git:
+  monitoring:

@@ -1,171 +1,102 @@
-# Lecture 8 — AI infrastructure (bonus lecture)
-
-The newest layer devops sets up for teams: agents, the tools they use, automation, and the cost of it all.
-
-This README is a **self-contained summary** — if you missed the lecture, you can learn the material here. It has two halves: first *what AI is made of and how processes are built from it*, then *where it runs and what it costs*.
-
----
-
-## 0. Before you start — think about it
-
-- Have you tried hosting your own model?
-- Do you only use chat, or build something more complex?
-- Do you use AI in your IDE?
-- Where in devops processes do you think AI could be plugged in?
-
-The whole lecture answers the last question: AI is now ordinary infrastructure — something a devops engineer deploys, gives access to, and pays for.
-
----
-
-## 1. AI chatbot
-
-> **AI chatbot** — a program that holds a natural-language dialogue: on each request the model generates a text answer, relying **only on what it learned during training**. It has no external tools and takes no actions — it answers, and a human does everything else.
-
-- The point: a chatbot **answers but doesn't act**.
-- **Example:** you ask "how do I restart a service?" → it gives you the command → *you* run it yourself.
-
----
-
-## 2. AI agent
-
-> **AI agent** — an automated system that meets three criteria *(Sber's definition)*:
-> - **Planning** — understand the task and build a plan of action;
-> - **Execution** — carry the actions out itself, using tools to interact with the outside world;
-> - **Autonomy** — follow the plan without approving every step with a human.
-
-Technically an agent is **LLM + tools + a loop**: the model decides which tool to call, sees the result, and continues until the task is done.
-
-**Example:** you ask "find open pull requests in our repo and remind the authors" → the agent lists the open PRs, then comments on each one — it carries out a multi-step task on its own, not just answering.
-
-**Chatbot vs agent:**
-
-| | Chatbot | Agent |
-|---|---|---|
-| What it does | Answers questions | Completes whole tasks |
-| Initiative | Waits for the next question | Plans the steps itself |
-| Tools | None — only the model's knowledge | Yes — acts in the outside world |
-| Autonomy | Every step is on the human | Acts without approving each step |
-
-> **A chatbot tells you what to do. An agent does it.**
-
----
-
-## 3. Tools and skills
-
-> **AI tool** — a concrete action the agent can call to get information or affect the outside world. It has two parts: a **description** (text the model sees: what it does and what input it needs) and a **handler** (what actually executes the call — usually code).
-
-The model itself does nothing in the world — it only decides *which tool to call*. The code around it does the work.
-
-**Example — a `get_weather` tool:**
-1. You ask: "should I take an umbrella in Moscow?"
-2. The model decides to call `get_weather(Moscow)`
-3. The code runs the call → returns "rain, +12"
-4. The model answers: "yes, take an umbrella"
-
-> **AI skill** — a reusable package of know-how: *how* to do a specific task — in what order to act and by what rules. A skill may include its own tools.
-
-**Example — an "incident triage" skill:** "first check the metrics → find the anomaly in the logs → if the service is down, restart it → post a summary in the channel." It relies on tools, but adds the order and the rules.
-
-**Tool vs skill:** a tool is *what* the agent can do; a skill is *how* it does a task well.
-
----
-
-## 4. Toolkit
-
-> **AI toolkit** — a ready-made **bundle of tools** built around one system or task, plugged into the agent as a whole.
-
-Instead of wiring tools in one by one, you hand the agent a whole box.
-
-**Example — a "GitHub" toolkit:** `create_issue` + `open_pull_request` + `list_commits` + `add_comment`. Give the agent this toolkit and it can work with GitHub as a whole.
-
-**Toolkit vs MCP server (below):** a toolkit is *what* set of tools the agent is given; an MCP server is *how* those tools are delivered — as a standalone service over a standard protocol.
-
----
-
-## 5. MCP and MCP servers
-
-> **Model Context Protocol (MCP)** — an open standard for connecting AI models to external tools and data over a single protocol.
-
-Analogy: **MCP is like USB-C for AI** — one connector instead of a custom cable for every system. Build a tool once to the standard, and any MCP-capable agent can use it.
-
-> **MCP server** — a service that exposes tools and data access to an agent over the MCP standard. Inside it is real code that talks to the actual system (a database, an API, files).
-
-- Can be **local** (a process running next to the app) or **remote** (a networked service).
-- Created by: the services themselves (GitHub, Slack), the community, or **your own internal devops** for internal systems.
-- **Examples:** a *GitHub MCP server* exposes the GitHub toolkit's tools (`create_issue`, `list_pull_requests`, …); a *filesystem MCP server* exposes `read_file`, `write_file`, `list_directory`. One server = one system, with several tools inside.
-- **devops angle:** a remote MCP server is a real service — deploy it, update it, limit access. *Toolkit = what the agent was given; MCP server = where it's deployed and who controls it.*
-
-**How the layers fit together:**
-
-> **skill — how to act · tool — what to do · MCP server — where the tool comes from and how it reaches the real system.**
-
----
-
-## 6. Automation platforms
-
-Once you have tools and skills, you need to **wire them into a process**. Two paths:
-
-- **Build it yourself** — code the orchestration (flexible, but slow to build and maintain).
-- **Use a ready-made workflow-automation platform** — assemble the process from blocks, often with no code.
-
-**Examples:**
-- **No-code / low-code:** **n8n** (self-hosted), **Zapier**, **Make** (cloud, simple)
-- **AI/agent-focused:** **Dify**, **Flowise**
-
-We use **n8n** because it's no-code yet self-hostable and close to devops.
-
----
-
-## 7. n8n
-
-> **n8n** — a workflow-automation platform: a visual builder where you assemble a process from blocks ("when X happens → do Y → then Z"). Mostly no-code, and you can self-host it.
-
-**Key concepts:**
-- **Workflow** — the scenario (a chain of steps)
-- **Node** — one step: a trigger, an action, or logic
-- **Trigger** — what starts the workflow (a webhook, a schedule, an event)
-- **Execution** — one run (you can see what worked and what failed)
-
-**Example process:** an incoming request email *(trigger)* → AI parses the text *(AI node)* → a Jira ticket is created *(action)* → a Slack notification is sent *(action)*. Note it mixes AI and non-AI steps.
-
-**devops angle:** n8n has **AI and agent nodes**, so an agent can be one of the steps. n8n is the "glue" that ties agents, AI and ordinary services into one process. devops self-hosts it, guards the connected credentials, and gives it to teams.
-
----
-
-## 8. Hosting and money *(after the break)*
-
-### Self-hosted vs cloud — the main fork
-
-Where does the model "live"? Either you **call a provider's API** (cloud) or **run the model yourself** (self-hosted). There's no universal answer — it's a trade-off.
-
-**Self-hosted**
-- ✅ Data stays in-house · full control · no vendor lock-in · cheaper at large volumes
-- ❌ Needs GPUs (expensive) · hard to run and maintain · you own uptime and scaling · models usually weaker than top cloud ones
-
-**Cloud**
-- ✅ Fast start · top models · scales itself · pay-as-you-go
-- ❌ Data leaves to a provider · vendor lock-in · gets pricier as volume grows (you pay per token) · you depend on provider limits and availability
-
-### GPU
-
-Models run on **GPUs**, not ordinary servers — so your own model needs GPUs. They're **expensive**, often **scarce**, and **burn money even when idle**. So "host your own" is, first of all, a money decision.
-
-### AI gateway
-
-> **AI gateway (proxy)** — a single entry point to the models for all teams.
-
-- **Counts tokens and cost** — you can see who spent how much
-- **Controls access** — keys, rate limits, can cut someone off
-- Can **balance** requests across models/providers
-
-> **Tokens** ≈ chunks of text. You pay per token — the more text you send and receive, the more it costs. Costs creep up quietly, then the bill arrives large.
-
----
-
-## Lab
-
-[Lab 8 — Automating a DevOps process with n8n + AI](lab.md): design a real automation use-case and build it in n8n with MCP servers, an AI toolkit and skills, then run it locally.
-
-## Further reading
-
-- [What an AI agent is and what parts it's made of](https://habr.com/ru/articles/951428/) (Habr, in Russian) — a breakdown of an agent's anatomy: the LLM as the "brain", tools, prompts, memory and planning. A good complement to sections 2–3.
+# Лаба 8 — Автоматизация devops-процесса с n8n + AI
+
+## Часть 1 — Придумай кейс
+Имеется команда из 15 человек, делает модный B2B SaaS-стартап, которых нет на рынке по мониторингу бизнес-метрик. В команде используют GitLab для кода и документации.
+Имеется несколько микросервисов, каждый со своей документацией
+
+Проблема: документация быстро устаревает. Разработчики меняют код, но ленятся и редко обновляют документацию.
+Во время сбоя дежурный sre постоянно сталкивается с тем, что документация только путает, а ранбуки не решают проблем. Решение - документация меняется AI при каждом мерже в master. Таким образом она всегда будет актуальна.
+
+* Кому это помогает? Это будет полезно в первую очередь команде разработки и devops-инжинерам. Отпадает необходимость погружаться в код, что позволяет быстро решать возникающие проблемы. Так же это будет полезно аналитикам для понимания работы сервиса 
+* Какую проблему решает? Документация и ранбуки быстро теряют свою актуальность -> ими невозможно пользоваться. Используя AI мы поддерживаем их актуальность
+* Почему сейчас это неудобно делать руками? Очевидно, никто не любит писать документацию
+* Что именно делает автоматизация от начала до конца: триггер → шаги → результат?
+  1. Разработчик мержит в мастер новый коммит
+  2. В прогоне пайплайна запускается workflow в n8n
+  3. AI-агент смотрит на коммит и анализирует его
+  4. AI-агент корректирует текущую документация на основе изменений в коде
+  5. Проводится валидация markdown
+  6. Коммит в репозиторий с документацией
+
+## Часть 2 — Что должно быть в реализации
+### Триггер
+Поднимаем n8n локально через докер
+```commandline
+docker run -it --rm  --name n8n  -p 5678:5678  \
+  -e GENERIC_TIMEZONE="Europe/Moscow"  -e TZ="Europe/Moscow"  \
+  -e N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS=true  \
+  -v n8n_data:/home/node/.n8n  \
+  n8nio/n8n
+```
+Локально уже имелась ollama. В n8n создали тестовый workflow, проверили подключение и работу
+![img.png](img/1.png)
+
+Потом создали 2 репозитория [api](api) и [docs](docs).
+Тут нужно было подключить эти папки в n8n, поэтому переписали с использованием docker-compose, репозитории перенесли как volume.
+
+
+Далее создали workflow, как на картинке
+![img.png](img/2.png)
+
+
+Теперь поднимем и подключим MCP-сервера. Добавили mcp-git и mcp-filesystem в docker-compose. mcp-git позволяет агенту использовать git, mcp-filesystem позволяет читать файлы в системе.
+Подключаем их в n8n, проверяем результат
+![img.png](img/3.png)
+
+Теперь выберем набор тулов, которые мы можем разрешить, т.к. например запись файла через mcp-filesystem разрешать нельзя. Мы не хотим править документацию через него.
+Был выбран следующий AI toolkit:
+1. read_text_file - для чтения документации и кода
+2. list_directory - для понятия того, какие файлы существуют
+3. git_diff - сбор изменений в коммитах
+4. git_log - посмотреть историю коммитов
+5. git_show - посмотреть контент коммита
+Так мы позволим AI-агенту собирать дополнительную информацию, но запретим ему как-либо менять репозиторий. Проверяем
+![img.png](img/4.png)
+
+Теперь создадим SKILL.md. Частично перенес старый System message из n8n. Теперь необходимо отредактировать workflow и добавить туда чтение скила. Так же переделаем изначальное получение данных. Итого получаем следующий конечный workflow
+![img.png](img/5.png)
+
+1. Webhook - триггер. ci в gitlab дергает метод в пайплайне, в рамках лабороторной вызов происходит руками через curl
+2. Git Diff - берутся последние коммиты и их изменения
+3. Current documentation - читается актуальная документация, Set documentation - мапим stdout в новое поле
+4. SKILL - читается SKILL.md, Set Skill - мапим stdout в skill
+5. Merge - собираются все данные
+6. AI Agent - происходит обогащение промпта [systemMessage](systemMessage.txt). В нем используется skill.md. В самом промпте передается git diff и текущая документация
+7. mcp-filesystem, mcp-git - mcp-клиенты к mcp-filesystem и mcp-git
+7. Validation + formatting - промптом четко зафиксировали ответ AI-агента в формате json, происходит парсинг этого ответа
+8. Coding to File - конвертация новой документации в байты для записи
+9. Merge1 - собираем ответ от javaScript и байты для записи
+10. Write documentation - записываем новую документацию
+11. Commit changes - коммитим изменения
+Важно, чтобы в запросе передавали в теле поле repository, по нему строятся команды и промпты
+
+Теперь пройдемся по чеклисту
+- [x] **Триггер** - вебхук
+- [x] **И AI-, и не-AI-шаги.**. AI-шаг - генерация документации, неAI-шаги - чтение файлов, запись файлов, коммит изменений
+- [x] **Минимум два MCP-сервера**: mcp-git, mcp-filesystem
+- [x] **AI toolkit на 3–5 инструментов.**: read_text_file, list_directory, git_diff, git_log, git_show
+- [x] **Описанные skills.** [SHILL.md](SKILL.md)
+- [x] **Конкретный результат** - изменений документации
+
+## Часть 3 — Запусти локально
+Поднял, запустил. Проверял следующий тест - добавил в последнем коммите ендпоинт /version, в документации после запуска появился коммит с описанием этого эндпоинта
+
+Пришлось убрать git в api и docs, но можно обратно переименовать из git в .git. А так вот скриншот истории в docs
+![img](img/7.png)
+
+Сам [workflow](workflow.json)
+
+## Часть 4 — Мониторинг (обязательно)
+Построили следующие дашборды:
+1. up{job="n8n"} - доступность n8n
+2. up{job="prometheus"} - доступность prometheus
+3. rate(n8n_process_cpu_seconds_total{}[5m]) - использование cpu
+4. n8n_process_resident_memory_bytes{} / 1024 / 1024 - использование memory в Гб
+5. n8n_active_workflow_count{} - количество активных workflow
+![img.png](img/6.png)
+
+Алерты:
+* `up{job="n8n"} == 0` - n8n недоступна, ничего не работает, нужно чинить
+* `up{job="prometheus"} == 0` - prometheus недоступен, ничего не работает, нужно чинить
+* `n8n_active_workflow_count == 0` - почему-то активные доступные workflow пропали
+* `n8n_process_resident_memory_bytes > 1073741824` - n8n потребляет более 1 Гб памяти, слишком много, потенцильно можно упереться в лимиты
