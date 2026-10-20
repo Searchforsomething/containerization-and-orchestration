@@ -19,7 +19,7 @@
 
 Далее создаем манифесты, нарушающие одно из правил политики. Как и ожидалось Kyverno не дает их применить. Некоторые манифесты нарушают сразу несколько правил. 1-й отклонен из-за отсутствия ограничения ресурсов, 2-й - образ не из docker.io/library/, 3-й - отсутствуют team и environment, 4-й - так как privileged: true, 5-й - используется тег latest.
 
-    ![alt text](img/3.png)
+![alt text](img/3.png)
 
 ## Часть 2
 
@@ -85,4 +85,4 @@ HighErrorRate (rate(http_requests_total{status=~"5.."}[5m]) > 0.1, for 2m) - р�
 
 PostgresNotReady (cnpg_collector_up == 0, for 1m) - оператор не может поддерживать кластер БД, данные под угрозой. Critical.
 
-![alt text](img/12.png)
+![alt text](img/13.png)
