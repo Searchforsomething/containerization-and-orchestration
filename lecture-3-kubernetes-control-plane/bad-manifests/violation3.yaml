@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: bad-no-labels
+spec:
+  containers:
+    - name: app
+      image: docker.io/library/nginx:1.25
+      resources:
+        limits:
+          cpu: 100m
+          memory: 128Mi

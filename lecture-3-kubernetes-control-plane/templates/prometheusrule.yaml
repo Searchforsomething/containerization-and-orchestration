@@ -1,0 +1,31 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: shop-alerts
+  labels:
+    release: monitoring
+spec:
+  groups:
+    - name: shop.rules
+      rules:
+        - alert: ApiNoReadyReplicas
+          expr: kube_deployment_status_replicas_ready{deployment="api"} == 0
+          for: 1m
+          labels:
+            severity: critical
+          annotations:
+            summary: "API has no ready replicas"
+        - alert: HighErrorRate
+          expr: rate(http_requests_total{status=~"5.."}[5m]) > 0.1
+          for: 2m
+          labels:
+            severity: warning
+          annotations:
+            summary: "High 5xx rate"
+        - alert: PostgresNotReady
+          expr: cnpg_collector_up == 0
+          for: 1m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Postgres cluster is not ready"
