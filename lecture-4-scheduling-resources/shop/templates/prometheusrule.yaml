@@ -1,0 +1,52 @@
+{{- if .Values.monitoring.enabled }}
+{{- $ns := .Release.Namespace }}
+{{- $sla := .Values.monitoring.sla }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: shop-alerts
+  labels:
+    release: {{ .Values.monitoring.releaseLabel }}
+    {{- include "shop.labels" . | nindent 4 }}
+spec:
+  groups:
+    - name: shop.sla
+      rules:
+        # 1. Нарушение SLA по задержке на пути заказа
+        - alert: OrderLatencySLABreach
+          expr: |
+            histogram_quantile(0.95,
+              sum by (le) (rate(http_request_duration_seconds_bucket{namespace="{{ $ns }}", path="/order"}[2m]))
+            ) > {{ $sla.latencySeconds }}
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: "p95 оформления заказа выше {{ $sla.latencySeconds }}s"
+            description: "p95 = {{ "{{" }} $value | humanizeDuration {{ "}}" }}. SLA критического пути нарушен."
+
+        # 2. Доля ошибок на пути заказа
+        - alert: OrderErrorRateHigh
+          expr: |
+            sum(rate(http_requests_total{namespace="{{ $ns }}", path="/order", status=~"5.."}[2m]))
+              /
+            sum(rate(http_requests_total{namespace="{{ $ns }}", path="/order"}[2m]))
+              > {{ $sla.errorRatio }}
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Больше {{ mulf $sla.errorRatio 100 }}% заказов падают с 5xx"
+            description: "Доля ошибок = {{ "{{" }} $value | humanizePercentage {{ "}}" }}."
+
+        # 3. Поды не помещаются в кластер
+        - alert: ShopPodsPending
+          expr: |
+            sum by (pod) (kube_pod_status_phase{namespace="{{ $ns }}", phase="Pending"}) > 0
+          for: 2m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Под {{ "{{" }} $labels.pod {{ "}}" }} висит в Pending больше 2 минут"
+            description: "Кластеру не хватает ресурсов по requests. Если это api/postgres — критический путь без резерва."
+{{- end }}

@@ -1,0 +1,41 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker
+  labels:
+    app.kubernetes.io/name: worker
+    {{- include "shop.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.worker.replicas }}
+  selector:
+    matchLabels:
+      app: worker
+  template:
+    metadata:
+      labels:
+        app: worker
+        app.kubernetes.io/name: worker
+        {{- include "shop.labels" . | nindent 8 }}
+    spec:
+      {{- include "shop.priorityClassName" (list . .Values.worker.priorityClass) | nindent 6 }}
+      containers:
+        - name: worker
+          image: {{ .Values.worker.image }}
+          env:
+            - name: DB_HOST
+              value: postgres-rw
+            - name: DB_NAME
+              value: shop
+            # пароль генерирует CNPG при initdb и кладёт в Secret <cluster>-app
+            - name: DB_USER
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-app
+                  key: username
+            - name: DB_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-app
+                  key: password
+          resources:
+            {{- toYaml .Values.worker.resources | nindent 12 }}

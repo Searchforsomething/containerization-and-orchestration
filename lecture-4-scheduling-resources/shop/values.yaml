@@ -1,0 +1,97 @@
+labels:
+  owner: student
+  team: dev
+  environment: lab
+
+priorityClasses:
+  enabled: true
+  critical:
+    name: shop-critical
+    value: 100000
+    description: "Критический путь заказа: api, postgres"
+  standard:
+    name: shop-standard
+    value: 1000
+    description: "Фоновые: worker"
+  batch:
+    name: shop-batch
+    value: -100
+    preemptionPolicy: Never
+    description: "Жертвуемая нагрузка: ночная аналитика"
+
+api:
+  replicas: 4
+  image: shop-api:1.3.0
+  healthFail: "false"
+  priorityClass: critical
+  service:
+    type: NodePort
+    nodePort: 30080
+  spread:
+    mode: topologySpread
+    topologyKey: kubernetes.io/hostname
+    antiAffinity:
+      type: required
+    topologySpread:
+      maxSkew: 1
+      whenUnsatisfiable: DoNotSchedule
+  resources:
+    requests:
+      cpu: 100m
+      memory: 100Mi
+    limits:
+      cpu: 100m
+      memory: 100Mi
+
+worker:
+  replicas: 2
+  image: shop-worker:1.0.0
+  priorityClass: standard
+  resources:
+    requests:
+      cpu: 10m
+      memory: 100Mi
+    limits:
+      cpu: 50m
+      memory: 100Mi
+
+postgres:
+  instances: 1
+  storageSize: 1Gi
+  priorityClass: critical
+  resources:
+    requests:
+      cpu: 300m
+      memory: 512Mi
+    limits:
+      cpu: 300m
+      memory: 512Mi
+
+batch:
+  replicas: 5
+  image: shop-batch:1.0.0
+  priorityClass: batch
+  memoryMB: 16
+  stepMB: 5
+  cpuDuty: "1.0"
+  resources:
+    requests:
+      cpu: 100m
+      memory: 32Mi
+    limits:
+      cpu: 300m
+      memory: 768Mi
+
+pdb:
+  enabled: true
+  api:
+    minAvailable: 1
+  postgres:
+    minAvailable: 1
+
+monitoring:
+  enabled: true
+  releaseLabel: monitoring
+  sla:
+    latencySeconds: 0.3
+    errorRatio: 0.01

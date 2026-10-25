@@ -1,162 +1,250 @@
-# Lecture 4 — Scheduling and resources
+# Лаба 4. SLA критического пути под перегрузкой
 
-In the previous lecture we saw the Kubernetes "brain": you declare the desired state, a controller creates pods, the scheduler assigns each pod to a node, and `kubelet` runs the containers. Two parts of that chain stayed black boxes. By what rules does the scheduler pick a node? And what happens to memory and CPU on the node itself under load — where do `OOMKilled` and mysterious slowdowns come from? Today we answer both, then cover a third question: where does data that must not be lost live, given that a container is ephemeral and everything written inside it disappears when the pod is recreated?
+Критический путь: оформление заказа `api -> postgres`. Второстепенная нагрузка: `batch` (ночная аналитика). Вся настройка сделана через Helm-чарт [shop/](shop/).
 
-The running example is the online shop `shop` with three services of different needs. Three `api` replicas should be spread across different nodes, so one machine failing does not take out every copy. Two `worker` pods are background processors, less critical, movable if needed. One `postgres` is the demanding one: it holds data that must not be lost and needs a stable name and a stable disk that survives pod recreation. On these three we show how to place, constrain, and store.
+Площадка: kind, 2 ноды (`shop-control-plane` без taint и `shop-worker`). Обе ноды это контейнеры на одном хосте, и каждая видит все его ресурсы. Поэтому в [kind-config.yaml](kind-config.yaml) каждой ноде урезана половина CPU (`systemReserved`) и часть памяти (`evictionHard.memory.available`). Без этого планировщик считал бы, что ресурсов вдвое больше, чем есть, а kubelet не заметил бы давления по памяти до OOM-killer'а ядра. Части 6 и 7 сначала шли на Docker Desktop с 4 CPU / 8 GB и порогом `4608Mi`. После зависания VM в Части 7 Docker Desktop переведён на 12 GB, порог на `60%`.
 
----
+## Часть 0. batch
 
-## Block 1. The scheduler from the inside
+[batch/batch.py](batch/batch.py) в бесконечном цикле набирает `BATCH_MEMORY_MB` памяти шагами по `BATCH_STEP_MB` в секунду и крутит sha256 долю `BATCH_CPU_DUTY` каждой секунды. Память набирается постепенно, чтобы kubelet успел заметить давление и выселить под раньше, чем сработает OOM-killer ядра. Параметры задаются в `values.yaml` (`batch.memoryMB`, `stepMB`, `cpuDuty`).
 
-### What the scheduler does
+## Часть 1. Механизм разнесения
 
-Its input is a pod without a node, sitting in `Pending`: created but not yet placed. Its output is a decision — "this pod goes to that node" — written through the API server. The scheduler runs nothing itself; `kubelet` on the chosen node starts the pod.
+Параметр `api.spread.mode` в [values.yaml](shop/values.yaml): `none | antiAffinity | topologySpread`.
 
-If no node fits, the pod stays `Pending` — it does not fail, it waits. The most common cause of a stuck `Pending` is not enough resources: the pod requests more memory or CPU than is free on any node. Why "requests" and not "uses" is a key subtlety we reach shortly.
+| | `podAntiAffinity` | `topologySpreadConstraints` |
+|---|---|---|
+| Правило | не ставить под рядом с подом с меткой X (нода либо подходит, либо нет) | разница числа подов между доменами топологии не больше `maxSkew` |
+| Реплик больше, чем нод | `required`: лишние висят в `Pending`; `preferred`: размещаются как получится, баланс не гарантирован | при `maxSkew: 1` раскладывает равномерно: 2+2, 3+2 и т.д. |
+| Масштабирование | при 4 репликах на 2 нодах `required` не работает | работает при любом числе реплик |
+| Rolling update | старые реплики мешают новым (при `required` и `maxSurge` новая реплика может не встать) | с `matchLabelKeys: [pod-template-hash]` баланс считается внутри одной ревизии |
+| Стоимость для планировщика | O(подов × нод), дорого на больших кластерах | дешевле |
 
-### Two stages: filtering and scoring
+Выбран `topologySpread` (`maxSkew: 1`, `whenUnsatisfiable: DoNotSchedule`, `topologyKey: kubernetes.io/hostname`). Нод всего две, а реплик `api` бывает больше (в Части 6 их 4). Жёсткий anti-affinity оставил бы лишние реплики в `Pending`, мягкий не гарантировал бы разнесение. Spread даёт и гарантию (на одной ноде не больше, чем на соседней, плюс один), и масштабирование. Тот же механизм без изменений переносится на зоны (`topology.kubernetes.io/zone`). Anti-affinity оставлен в шаблоне как альтернатива.
 
-The scheduler picks a node in two stages. First, filtering: it walks all nodes and drops those that clearly do not fit — not enough requested resources, wrong node type, pod not allowed there. What remains is the list of feasible nodes. Second, scoring: from the feasible nodes it must pick not any but the best, so it grades each by a set of rules and takes the highest.
+## Часть 2. Тесная площадка
 
-Analogy — hiring: first screen out candidates who fail hard requirements, then pick the best of those who pass.
+`batch` добавлен шаблоном [batch-deployment.yaml](shop/templates/batch-deployment.yaml) с requests `100m/32Mi` и limits `300m/768Mi`. Гвардрейлы Kyverno из Лабы 3 действуют без исключений, в [policies.yaml](policies.yaml) только добавлен разрешённый образ `shop-batch:*`. Деплой через `helm upgrade --install` с оверлеем: числа из Лабы 3, без разнесения, приоритетов и PDB.
 
-### Filtering: requests as the basis of scheduling
+## Часть 3. krr вместо угадывания
 
-The main filtering criterion is resources, and here is where almost everyone trips. A pod has `requests` — how much memory and CPU it is guaranteed to need. The scheduler looks not at current real usage but at the **sum of `requests`** of all pods already assigned to a node. A node fits only if its free capacity by `requests` (total minus what is already reserved by requests) holds the new pod's `requests`.
+Нагрузка: k6, `constant-arrival-rate`, 30 заказов/с. Затем `krr simple -n shop -p http://localhost:9090 --history_duration 1 --points_required 10`, отчёт в [krr/krr-report.txt](krr/krr-report.txt).
 
-Hence a common, puzzling case: a node is really loaded at about 30%, plenty of free memory, yet a new pod still sits `Pending`. The cause is not real load but the reservation: by summed `requests` the node already counts as full, even if pods do not yet use what they asked for. The scheduler thinks in reserved requests, not actual usage — the first thing to check on an unexplained `Pending`.
+Первый запуск krr против изначальной догадки, в колонке Diff видно расхождение:
 
-### Filtering: where a pod is allowed to run
+![](img/03-krr-first.png)
 
-Besides resources, filtering honors placement rules that steer pods to the right places.
+Повторный запуск на финальных числах:
 
-`nodeSelector` and its more flexible form `node affinity`: "place this pod only on nodes with a given label." You put `labels` on nodes yourself — for example `disktype=ssd` or zone `eu-west`. A service needing a fast disk gets `disktype=ssd` and lands only on SSD nodes; the scheduler drops the rest during filtering.
+```
+Name    CPU Requests          CPU Limits     Memory Requests         Memory Limits
+api     (-55m)  100m -> 45m   100m -> unset  (+0m)   100Mi -> 100Mi  100Mi -> 100Mi
+batch   (+200m) 100m -> 301m  300m -> unset  (+666Mi) 32Mi -> 698Mi  768Mi -> 698Mi
+worker  (+0m)   10m  -> 10m   50m  -> unset  (+0m)   100Mi -> 100Mi  100Mi -> 100Mi
+```
 
-`taints` and `tolerations` work the opposite way. A selector attracts a pod to nodes; a `taint` ("repel mark") on a node repels pods: "no ordinary pods here." A `toleration` on a pod is a pass: "I tolerate that taint, let me in." Like a face-control at the door: the node admits no one except pods with the matching `toleration`. This is how you dedicate nodes to `postgres` or GPU: add a `taint` so stray pods stay away, give your own pods a `toleration`. Ordinary pods do not land on master nodes (`control plane`) for exactly this reason — they carry a default `taint`.
+postgres в отчёт krr не попал: его поды принадлежат CRD `Cluster` из CNPG, а не Deployment или StatefulSet. Для него числа посчитаны вручную в Prometheus по тому же алгоритму, что у krr `simple`: CPU как p95, память как максимум плюс 15%.
 
-### Scoring and spreading: don't put all eggs in one basket
+![](img/03-krr-postgres-cpu.png)
 
-Feasible nodes then get scored. One of the most practical criteria is how to spread related pods.
+![](img/03-krr-postgres-mem.png)
 
-- `pod anti-affinity` — "do not put these pods on the same node." Exactly what three `api` replicas need: if all three land on one node and it dies, the whole service is lost; anti-affinity spreads them out.
-- `pod affinity` — the reverse, "put these pods together" — e.g. a cache close to the service that uses it, for a shorter network hop.
-- `topology spread` — a newer, more flexible way: "distribute pods evenly across zones or nodes," not a hard "never together" but a soft "keep the balance."
+| Сервис | Догадка (Лаба 3), req / lim | krr | В `values.yaml` |
+|---|---|---|---|
+| api | CPU 100m / 200m, mem 128Mi / 256Mi | CPU 45-50m, mem 100Mi | CPU 100m / 100m, mem 100Mi / 100Mi (Guaranteed) |
+| worker | CPU 100m / 200m, mem 128Mi / 256Mi | CPU 10m, mem 100Mi | CPU 10m / 50m, mem 100Mi / 100Mi (Burstable) |
+| postgres | CPU 100m / 500m, mem 256Mi / 512Mi | CPU 111m, mem 107Mi | CPU 150m / 150m, mem 256Mi / 256Mi (Guaranteed) |
+| batch | CPU 100m / 300m, mem 128Mi / 768Mi | CPU 301m, mem 698Mi | не переносилось: 100m / 300m, 32Mi / 768Mi (Burstable) |
 
-For `api` we would use `anti-affinity` or `spread` to get one replica per node or zone. A direct gain in fault tolerance, configured declaratively.
+Почему разошлось:
 
-### Preemption: eviction by priority
+- Память api и worker была завышена в 1.3-2.5 раза. Flask с psycopg2 держит 30-50 МиБ: процесс ничего не кэширует. На кластере из двух нод лишние 128-256Mi это резерв, который планировщик вычитает из allocatable.
+- CPU api завышен вдвое. При 30 заказах/с api тратит 15-50m, почти всё время он ждёт postgres.
+- worker почти не потребляет CPU (10m вместо 100m): один UPDATE раз в 5 секунд.
+- По CPU postgres догадка оказалась близкой (100m против 111m), а лимит 500m был с пятикратным запасом. По памяти krr насчитал 107Mi, но оставлено 256Mi, потому что `shared_buffers` по умолчанию 128MB. В Части 8 выяснилось, что под перегрузкой не хватает и этого.
+- Для batch рекомендации krr бессмысленны. batch съедает всё, что разрешает лимит, поэтому p95 CPU упирается в 300m, и krr предлагает больше (301m). Для второстепенной нагрузки requests определяются приоритетом, а не потреблением.
+- krr `simple` советует CPU request = p95 и не задаёт CPU limit, потому что лимит вызывает троттлинг. Для QoS Guaranteed нужен `limit = request`, а гвардрейлы требуют лимит, поэтому CPU округлён вверх: api 45m до 100m, postgres 111m до 150m.
 
-What if an important pod does not fit because every feasible node is full? Priority steps in. Each pod can get a `priorityClass` — essentially a number of how important it is. If a high-priority pod does not fit, the scheduler may perform `preemption`: it evicts one or more lower-priority pods to make room. Evicted pods are not lost — they return to `Pending` and get rescheduled, usually onto other nodes.
+## Часть 4. Разнесение api
 
-Example: a critical `postgres` cannot start because the cluster is packed, while low-priority background jobs like nightly analytics run nearby. With priorities the scheduler moves the background jobs aside for the database. It guarantees the important always finds room even in a full cluster — but use priorities carefully so you do not start evicting what you need.
+![](img/04-spread.png)
 
----
+Реплики `api` стоят на разных нодах. Если одна нода откажет (железо, kernel panic, `drain`, перезагрузка), пропадёт только часть реплик. Service продолжит отправлять трафик на оставшиеся, а Deployment тем временем поднимет замену. Без разнесения планировщик мог бы поставить все реплики на одну ноду, и её отказ положил бы весь сервис.
 
-## Block 2. Resources and pressure
+## Часть 5. Приоритеты, QoS, PDB
 
-### requests and limits: different roles
+Шаблоны: [priorityclasses.yaml](shop/templates/priorityclasses.yaml), [pdb.yaml](shop/templates/pdb.yaml). Значения в секциях `priorityClasses` и `pdb` файла [values.yaml](shop/values.yaml).
 
-Everyone writes `requests` and `limits`, and everyone confuses them. `requests` is how much a pod is guaranteed to need, and it has two roles. First, scheduling: the scheduler places the pod by `requests`, reserving room on the node (Block 1). Second, at runtime: when several pods fight over CPU, the kernel splits CPU time in proportion to their `requests`; so `requests` also sets the pod's share of CPU when there is not enough to go around. The same `requests` works in two places — placement and the CPU fight.
+| Под | QoS | PriorityClass | PDB |
+|---|---|---|---|
+| api | Guaranteed (req = lim, числа krr) | `shop-critical` (100000) | `minAvailable: 1` |
+| postgres | Guaranteed | `shop-critical` | `minAvailable: 1` (собственный PDB оператора выключен через `enablePDB: false`, чтобы не было двух) |
+| worker | Burstable | `shop-standard` (1000) | нет |
+| batch | Burstable (32Mi / 768Mi) | `shop-batch` (-100, `preemptionPolicy: Never`) | нет |
 
-`limits` is different: a hard ceiling the pod cannot exceed.
+![](img/05-qos.png)
 
-Units. CPU is measured in millicores: `1000m` is one whole core, so `200m` is one fifth of a core. Memory is in mebibytes (`Mi`), practically the same as megabytes. For `api`: `requests` `200m` CPU / `256Mi` for placement and share; `limits` `1` CPU / `512Mi` as the ceiling.
+Что даёт каждая настройка под давлением:
 
-The key link to Lecture 1: `limits` on the node become the very `cgroups` we discussed. In one sentence: a `cgroup` is a Linux kernel mechanism that takes your container's process group and assigns it ceilings on memory and CPU; the limit you write on a pod is the setting of that `cgroup` on the node. Your YAML numbers descend into a concrete kernel mechanism — which is why memory and CPU behave differently.
+- `shop-critical`: если `api` или `postgres` не помещаются, планировщик вытесняет (preemption) поды с более низким приоритетом. Кроме того, приоритет учитывается kubelet при выселении.
+- `shop-batch` со значением -100: это ниже дефолтного 0, который получают поды без класса (мониторинг, Kyverno). Иначе kubelet мог бы выселить Prometheus раньше batch. `preemptionPolicy: Never` запрещает batch вытеснять других, он только ждёт в очереди.
+- QoS Guaranteed (requests = limits по CPU и памяти во всех контейнерах): `oom_score_adj = -997`, и OOM-killer ядра трогает такой под последним. Потребление не превышает requests, поэтому при давлении по памяти kubelet выберет его, только когда других кандидатов не останется. CPU-лимит совпадает с резервом.
+- QoS Burstable у batch: `oom_score_adj` от 2 до 999 (чем меньше request относительно памяти ноды, тем выше). Под может потреблять больше requests, пока на ноде есть место, и как раз это превышение делает его первым кандидатом на выселение.
+- PodDisruptionBudget защищает от добровольных нарушений через Eviction API: `kubectl drain`, обновление нод, autoscaler. Он не даст убрать последнюю реплику `api` или `postgres`. От выселения kubelet при нехватке ресурсов PDB не защищает, а при preemption учитывается только по возможности. В этих случаях работают приоритет и QoS.
 
-### Memory kills by termination, CPU by delay
+Порядок выселения Burstable и Guaranteed. При нехватке памяти kubelet сортирует поды по трём признакам: превышает ли потребление requests, приоритет, на сколько превышает. Guaranteed никогда не превышает requests и оказывается в конце очереди. Burstable, который потребляет больше requests, оказывается в начале, и среди таких первым идёт под с меньшим приоритетом. Отдельно от kubelet ядро при глобальном OOM убивает процесс с наибольшим `oom_score`: у Burstable он высокий, у Guaranteed минимальный. BestEffort (без requests и limits) шёл бы первым, но гвардрейлы его запрещают. Поэтому batch менее защищён из-за класса и приоритета, а не из-за отсутствия лимитов.
 
-Memory and CPU react to hitting the limit in fundamentally different ways.
+## Часть 6. Pending и preemption
 
-Memory: if a container exceeds its memory limit, the kernel forcibly terminates the process — you see `OOMKilled`, and `kubelet` restarts the container. If it repeats in a loop (start, eat, terminate, start again), you get the familiar `CrashLoopBackOff`.
+`batch.replicas` поднят с 4 до 30, часть подов осталась в `Pending`.
 
-CPU: hitting the CPU limit does not terminate the process; it is slowed until the next period — `throttling`. About the "period": the kernel hands out CPU time in short windows, usually `~100 ms`. In each window the pod has a quota set by its limit. Spend the quota before the window ends and the pod is paused until the next window, even if the CPU is idle. Hence the sneaky symptom: the pod passes every health check, does not crash, yet answers slowly and unevenly because it is periodically frozen for the rest of each window.
+![](img/06-pending.png)
 
-These are the same `cgroups` from Lecture 1, set via the pod's `resources` field. Kubernetes adds no new physics. Same diagnosis: `OOMKilled` — look at memory; slowdowns without errors — check CPU throttling.
+Наблюдения:
 
-### QoS classes: who gets sacrificed first
+- Планировщик считает по сумме requests. `Insufficient cpu` значит, что на нодах не осталось allocatable CPU под очередные 100m request. Фактическое потребление в этом решении не участвует. Здесь оно тоже высокое (`kubectl top nodes`: 88% и 108%), но только потому, что batch крутит CPU до своего лимита 300m. На почти пустой ноде планировщик ответил бы так же.
+- batch никого не вытесняет: `preemption: not eligible due to preemptionPolicy=Never`.
+- В одном из ранних событий было ещё `1 node(s) had untolerated taint(s)`. В тот момент на ноде стоял taint `node.kubernetes.io/memory-pressure` (подробнее в Части 7: с первыми настройками batch давление по памяти возникало уже здесь).
+- У `postgres-1` при перезапуске было `1 node(s) didn't match PersistentVolume's node affinity`. Том local-path лежит на `shop-control-plane`, и postgres может встать только туда. Для stateful-пода разнесение и preemption ограничены диском.
 
-From how you set `requests` and `limits`, Kubernetes assigns the pod one of three quality-of-service (`QoS`) classes.
+Затем `api.replicas` увеличен с 2 до 4. Новые реплики `api` (приоритет 100000) не помещаются. Планировщик находит на ноде поды с меньшим приоритетом, которые освобождают нужные requests, проставляет `nominatedNodeName`, удаляет их (`Preempted`) и ставит `api`. Вытесненные поды batch не пропадают: Deployment создаёт замену, и она встаёт в `Pending`.
 
-- `Guaranteed` — `requests` equal `limits` for all resources; the most protected.
-- `Burstable` — `requests` are set but the `Guaranteed` condition is not met (limit above request, or not set for everything); the pod may temporarily take more than requested; middle class.
-- `BestEffort` — neither `requests` nor `limits` set; the least protected.
+![](img/07-preemption-events.png)
 
-Why it matters: when a node runs short on memory, `kubelet` evicts pods to save the node, strictly by class — first `BestEffort`, then `Burstable`, and `Guaranteed` last. A pod with no resources set is first on the block. So: do not leave important services in `BestEffort`.
+![](img/07-preemption-pods.png)
 
-### Two different "pod got killed": OOM by limit vs eviction by node pressure
+## Часть 7. Давление по памяти
 
-These two are constantly confused, yet treated differently.
+`batch.memoryMB: 600` при лимите 768Mi и request 32Mi. В сумме это больше, чем память нод.
 
-First — `OOMKilled` by its own limit: a specific container exceeded its own memory limit and the kernel terminated it. The pod is at fault — either the limit is too low or there is a leak. In the pod's events you see `OOMKilled` and the limit overrun.
+![](img/08-eviction-events.png)
 
-Second — `eviction` under `node pressure`: memory or disk runs out across the whole node, and `kubelet`, to save the machine, evicts pods by `QoS` class starting with `BestEffort`. Here your pod may be entirely innocent — it behaved well but sat in an unprotected class on an overloaded node. The events show `Evicted` and a node-pressure message. Fix `OOMKilled` by examining the pod; fix `eviction` by looking at the node overall and at `QoS`.
+![](img/08-eviction-status.png)
 
-### Example on shop: fixing postgres and api
+На ноде `shop-worker` появился `MemoryPressure=True`, и kubelet выселил поды batch. Каждый держал около 385 МиБ при request 32Mi, то есть превышал requests сильнее всех и имел самый низкий приоритет (-100). `api` и `postgres-1` остались в `Running`: у Guaranteed потребление не превышает requests, и они в конце очереди. Причина в QoS и приоритете, а не в отсутствии лимитов. Лимит у batch был, и он его не превысил (385 МиБ при лимите 768Mi).
 
-Case one: `postgres` started with no resources at all, so it is `BestEffort`. An evening spike brings memory pressure on the node, `kubelet` starts evicting — and the first to go is our data-holding `postgres`. Fix: set its `requests` equal to `limits` so it becomes `Guaranteed` and is evicted last, and move it to a dedicated node via a `taint` from Block 1 so neighbors do not interfere.
+Первая попытка прошла иначе. Тогда у batch был memory request 128Mi при фактических 70 МиБ, а у Prometheus и Grafana requests не было совсем. При давлении kubelet первыми выселил Prometheus и Grafana (`request is 0, has larger consumption of memory`), а batch не тронул, хотя у мониторинга приоритет выше (0 против -100):
 
-Case two: `api` runs and does not crash but answers ever slower under load. The cause is a too-low CPU limit, constant `throttling`. Fix: raise the CPU limit or remove it, keeping a sensible `requests`. Why removing the limit helps, counterintuitive as it sounds: `throttling` only happens when you hit the limit; no limit, no ceiling to throttle against — the pod takes as much CPU as is actually free and the uneven delays vanish. But then the pod could grab a lot of CPU on a spike, so keep `requests` anyway for the fair share and scheduling.
+![](img/08-eviction-monitoring.png)
 
-Bottom line: `requests` and `limits` are not a formality to please a linter but a direct tool for controlling reliability and speed.
+Так вышло из-за порядка критериев: сначала проверяется превышение requests, и только потом приоритет. batch укладывался в свои requests, мониторинг нет. Исправлено двумя правками: batch получил memory request 32Mi, заведомо ниже реального потребления, а Prometheus и Grafana получили requests на уровне фактического потребления ([kps-values.yaml](kps-values.yaml)). Получается, низкий priorityClass без правильных requests не гарантирует, что под выселят первым.
 
----
+Кроме того, при 10 подах по 600 МиБ на Docker Desktop с 8 GB зависла вся VM Docker. Двум нодам и самой VM не хватило памяти, VM ушла в swap раньше, чем kubelet успел выселить поды. После этого в [kind-config.yaml](kind-config.yaml) порог изменён на `memory.available: 60%` для VM на 12 GB (около 2.4 ГБ остаётся самой VM), а batch набирает память медленнее (`stepMB: 5`).
 
-## Block 3. State and storage
+Evicted и OOMKilled это два разных случая:
 
-### The problem: a container is ephemeral
+| | Evicted (давление на ноде) | OOMKilled (собственный лимит) |
+|---|---|---|
+| Кто убивает | kubelet по порогу `evictionHard` | ядро, когда cgroup контейнера упирается в `limits.memory` |
+| Причина | ноде не хватает памяти в сумме, под мог быть в пределах своего лимита | контейнеру нужно больше своего лимита |
+| Статус | под `Failed`, `reason: Evicted`, удаляется с ноды, контроллер создаёт новый (возможно, на другой ноде) | контейнер перезапускается в том же поде, `Last State: OOMKilled`, exit 137, растёт `RESTARTS`, дальше CrashLoopBackOff |
+| Состояние ноды | `MemoryPressure=True` | `MemoryPressure=False` |
+| Что делать | добавить ёмкость, приблизить requests к факту, настроить приоритеты | поднять лимит или искать утечку |
 
-From Lecture 1: a container has a thin writable layer, and it is ephemeral — it lives exactly as long as the container. In Kubernetes pods are recreated constantly: on updates, on moving to another node, on crashes. Each recreation is a new container with a clean writable layer.
 
-For `api` and `worker` this is fine: they are stateless, holding nothing important inside. For `postgres` it is a disaster: its data would sit in that layer and vanish on the first pod recreation. So data must live outside the container — in storage that survives pod recreation and moving to another node.
+## Часть 8. SLA под нагрузкой
 
-### Volumes
+SLA: 95% заказов (`POST /order`) обрабатываются быстрее 300 мс, ошибок меньше 1%, в том числе во время перегрузки. Те же пороги заданы в thresholds k6 и в алертах.
 
-A `volume` is storage attached to a pod that lives apart from the container's writable layer, by its own rules. Volumes come in many kinds, differing in durability. Simple temporary ones — like `emptyDir`, an empty folder created for the pod's lifetime and deleted with it; good for cache or sharing files between containers of one pod, not for important data. Persistent volumes sit on a real disk or network storage and survive everything: container recreation, pod recreation, and moving to another node. `postgres` needs a persistent volume. But to give a pod one, you need a real disk somewhere — hence the `PV`/`PVC` pair.
+SLA выполнен со второй попытки. Первый прогон не прошёл (p95 3.0 с, 6.96% ошибок). По метрикам нашлась причина, после исправления (пул соединений и больше ресурсов для postgres) повторный прогон дал p95 36.78 мс и 0.07% ошибок.
 
-### PV, PVC, StorageClass
+### Первый прогон
 
-Three concepts solve one task — decoupling the application from a specific disk.
+Нагрузка: k6, 30 заказов/с, 30 минут (00:55-01:25). Перегрузка: в 00:59 `batch.replicas: 30`, в 01:00 `api.replicas: 4` (preemption из Части 6).
 
-- `PV` (`PersistentVolume`) — a concrete piece of storage in the cluster: a real disk or network volume of a given size.
-- `PVC` (`PersistentVolumeClaim`) — a pod's request: "give me 100 GB of storage of such a class." The pod asks not for a named disk but for an abstract claim — how much and of what quality. Kubernetes finds or creates a matching `PV` and binds them.
-- `StorageClass` — describes how to provide storage: disk type, fast or slow, which cloud. Crucially it enables dynamic provisioning: as soon as a pod creates a `PVC`, a new real disk is created for it automatically, no manual pre-slicing.
+![](img/11-sla-start.png)
 
-The application says "give me 100 gigabytes" and the cluster finds or creates a disk and attaches it. A familiar `Pending` on a `PVC` is often a missing `StorageClass` or an inability to provision a disk.
+![](img/11-sla-overload.png)
 
-### CSI: how any storage plugs in
+![](img/12-batch-phases.png)
 
-There are countless storage systems: AWS and Google Cloud disks, distributed systems like `Ceph`, plain old `NFS`, local SSDs. How does Kubernetes work with all of them without carrying every vendor's code? Through a standard interface — `CSI` (`Container Storage Interface`). It is a contract: any storage vendor writes a `CSI` driver (plugin) that can, on Kubernetes' command, create a volume, attach it to a node, detach it, take a snapshot. Once the driver exists, that vendor's disks work natively in the cluster.
+![](img/10-k6-summary.png)
 
-Note the recurring pattern: Lecture 1 had `CRI` for runtimes, the networking lecture will have `CNI`, here `CSI` for storage. Kubernetes standardizes its boundaries through interfaces to stay independent of specific implementations.
+Числа из Prometheus (гистограмма `http_request_duration_seconds` в api):
 
-### StatefulSet: stable identity
+| Интервал | p50 | p95 | Ошибки | batch |
+|---|---|---|---|---|
+| без нагрузки batch, 00:30-00:44 | 6 мс | 97 мс | 0% | 4 Running |
+| перегрузка, 01:03-01:10 | 46 мс | 1.82 с | 0.7% | 17 Running / 13 Pending / 2 Failed |
+| перегрузка, 01:14-01:24 | 131 мс | 1.80 с | 0% | 17 Running / 13 Pending / 2 Failed |
+| вся перегрузка с рестартами postgres, 00:59-01:25 | 103 мс | 3.57 с | 8.4% | |
+| итог k6 за 30 минут | 94 мс | 3.0 с | 6.96% | |
 
-For stateless services (`api`, `worker`) we use a `Deployment`, and it is ideal: pods are identical and interchangeable, with random names, any replaceable by any. For `postgres` that is not enough — it needs identity. Hence `StatefulSet`. What it adds over `Deployment`:
+Без перегрузки SLA выполняется с запасом (p95 97 мс), под перегрузкой нет. batch деградировал как и планировалось: 13 подов в `Pending`, часть вытеснена и выселена, а критический путь в `Pending` не попадал ни разу (на панели «Поды по фазам» `critical Pending = 0`). Но задержка заказа выросла примерно в 20 раз, и было два периода со 100% ошибок.
 
-- **stable names** — pods are named in order (`postgres-0`, `postgres-1`, ...), and the names do not change on recreation: recreated, it is `postgres-0` again;
-- **its own persistent storage per pod** — each has its own `PVC` and disk, and on recreation the disk moves with the pod, so data is not lost or mixed between pods;
-- **ordered start and stop** — pods come up and go down in sequence (`0`, then `1`, then `2`), which matters for replicated databases where the primary must start first.
+Что показали метрики:
 
-So a `StatefulSet` gives the database a lasting identity and its own data.
+- Периоды со 100% ошибок в 01:01 и 01:11 совпадают с рестартами `postgres-1`. В 01:01 он не прошёл liveness-пробу (`Get https://...:8000/healthz: read: connection reset by peer`), в 01:10:40 получил `OOMKilled` по своему лимиту 256Mi. Пока postgres поднимался, заказы падали.
+- postgres упирался в CPU-лимит: при лимите 150m троттлилось 30-64% CFS-периодов. Каждый заказ открывал новое соединение, то есть `fork` backend-процесса и SCRAM-аутентификацию. Пока backend'ы ждали CPU, их становилось больше, росла память, и в итоге случился OOM.
+- Без перегрузки этого не было, потому что krr измерял postgres без конкуренции за CPU. В kind обе ноды делят 4 ядра VM Docker, и 17 подов batch по 300m (5.1 ядра спроса) отнимают процессорное время даже у Guaranteed-подов. `cpu.weight` по requests делит CPU только внутри одной ноды, а не между контейнерами-нодами на одном хосте.
 
-### Run a database in Kubernetes deliberately
+Guaranteed и высокий приоритет защитили критический путь от вытеснения (его не тронули ни preemption, ни eviction), но не от собственного лимита. CPU-лимит на уровне p95 из спокойного режима оказался потолком, в который postgres упёрся при первой конкуренции. Для SLA под перегрузкой нужно:
 
-`StatefulSet` and `PVC` solve two things — identity and storage — but not the full operation of a database. Backups, restore testing, version upgrades without data loss, replication setup, failover to a replica when the primary dies — a `StatefulSet` does none of that.
+1. Перестать открывать соединение на каждый заказ: пул соединений в api (`psycopg2.pool`) вместо `connect()` на запрос.
+2. Дать postgres запас относительно krr: CPU 300m, память 512Mi. krr показывает потребление в спокойном режиме, а не размер под перегрузку.
+3. Повторить прогон k6 и сравнить.
 
-So in practice databases in Kubernetes usually run not on a bare `StatefulSet` but through an operator (from the control-plane lecture): the operator encodes all this operational work and does it for you. The grown-up conclusion: running a database in the cluster is a deliberate engineering decision, not "just deploy `postgres` and forget it." Either you take a mature operator that carries backups and failover, or you deliberately keep the database outside the cluster in a managed service. For `shop` a `postgres` operator would be reasonable — it configures `StatefulSet`, `PVC`, and all of today's pieces under the hood.
+### Исправление и повторный прогон
 
----
+Изменения:
 
-## Summary
+- api 1.3.0 с пулом соединений ([api/app.py](api/app.py)): `ThreadedConnectionPool` на 10 соединений на реплику и семафор, чтобы запрос ждал свободное соединение, а не падал. postgres больше не делает `fork` и SCRAM на каждый заказ, число backend'ов ограничено (4 реплики по 10 = 40 при `max_connections = 100`). Соединение, на котором произошла ошибка (например, после рестарта postgres), закрывается и не возвращается в пул. Проверено на отдельном postgres: 60 одновременных заказов через пул из 3 соединений дали 60 ответов 201 при 2 backend'ах; после рестарта postgres упал один запрос, следующие прошли.
+- postgres 300m / 512Mi (Guaranteed). Числа krr (111m / 107Mi) это нижняя граница для спокойного режима, критическому пути нужен запас под конкуренцию за CPU и рост числа backend'ов.
 
-- **Scheduler**: filtering (resources by `requests`, selectors, `taints`) → scoring (`anti-affinity`/`spread`) → node.
-- `requests` is a reservation — hence `Pending` on a seemingly free node; `taints` repel, selectors attract; `anti-affinity` spreads replicas; `preemption` evicts by priority.
-- `requests` works in two places (scheduling and fair CPU share), `limits` is a hard ceiling that descends into the `cgroups` from Lecture 1.
-- Memory over the limit kills by termination (`OOMKilled`), CPU by delay (`throttling` in ~100 ms windows).
-- `QoS` classes (`Guaranteed`/`Burstable`/`BestEffort`) set the eviction order under pressure; give important services `Guaranteed`.
-- Tell apart `OOMKilled` by own limit (pod's fault) from `eviction` by node pressure (node's fault).
-- State: a container is ephemeral → data in volumes; `PVC` (claim) → `PV` (real volume), `StorageClass` for dynamic provisioning; `CSI` is the standard for attaching any storage.
-- `StatefulSet` gives a database stable names, its own disk, and ordering; full operation is handled by an operator or a managed service.
+Нагрузка: k6, 30 заказов/с, 35 минут (02:02-02:37). Что происходило в кластере (по `helm history` и метрикам):
 
-> Lab: keep the critical path alive under overload — see [lab.md](lab.md).
+| Время | Действие | Состояние |
+|---|---|---|
+| 02:02-02:04 | без изменений | api 4 реплики (Guaranteed, остались после Части 6), batch 4 Running |
+| 02:04:39 | `batch.replicas: 30` | 15 batch Running, 15 Pending (`Insufficient cpu`, `preemptionPolicy=Never`) |
+| 02:07-02:12 | | `ShopPodsPending` в состоянии firing (15 подов) |
+| 02:12-02:13 | `batch.memoryMB: 600`, затем откат | batch набрал около 300 МиБ, давления по памяти не возникло |
+| 02:13:27 | `batch.replicas: 5`, `memoryMB: 16` | спокойный режим до конца прогона |
+
+![](img/10-k6-summary-rerun.png)
+
+![](img/11-sla-rerun-start.png)
+
+Числа из Prometheus и k6:
+
+| | До исправления | После исправления |
+|---|---|---|
+| p95 без перегрузки | 97 мс | 10 мс (02:13-02:37) |
+| p95 при перегрузке по CPU (batch 30, Pending) | 1.82 с | 154 мс (02:05-02:13) |
+| p99 при перегрузке по CPU | | 868 мс |
+| ошибки 5xx на `/order` | 8.4% | 0 |
+| итог k6: p95 / failed | 3.0 с / 6.96% | 36.78 мс / 0.07% |
+| рестарты `postgres-1` за прогон | 2 (liveness и OOMKilled) | 0 |
+| троттлинг postgres | 30-64% периодов | меньше 10% |
+| CPU postgres при 30 заказах/с | 110-130m | 20-40m |
+| память postgres | до 256Mi, затем OOMKilled | 70-87 МиБ из 512Mi |
+
+После исправления SLA выполняется под перегрузкой. Итог k6 за 35 минут: p95 36.78 мс при пороге 300 мс и 0.07% неуспешных запросов при пороге 1%. Ни один из двух critical-алертов не сработал. Деградировал только batch: половина его подов была в `Pending`, сработал warning `ShopPodsPending`.
+
+Основной эффект дал пул соединений. CPU postgres при той же нагрузке снизился с 120m до 20-40m, примерно в 4 раза, потому что больше нет `fork` и SCRAM-аутентификации на каждый заказ. Число backend'ов фиксировано, память postgres стабильна (до 87 МиБ). Дополнительные ресурсы postgres (300m / 512Mi) убрали троттлинг, а вместе с ним провалы liveness-пробы и рестарты.
+
+## Часть 9. Мониторинг
+
+Шаблоны: [servicemonitor.yaml](shop/templates/servicemonitor.yaml) (метрики `api` с `/metrics`), [prometheusrule.yaml](shop/templates/prometheusrule.yaml), [grafana-dashboard.yaml](shop/templates/grafana-dashboard.yaml) (ConfigMap с [shop-sla.json](shop/dashboards/shop-sla.json), Grafana подхватывает его через sidecar).
+
+Дашборд «Shop — SLA критического пути»: задержка p50/p95/p99 с линией SLA, запросы по статусам, доля ошибок, поды по фазам (критический путь отдельно от batch), память и CPU по подам, троттлинг api и postgres, выселения и рестарты. Скриншоты дашборда в Части 8.
+
+Алерты:
+
+1. `OrderLatencySLABreach` (critical): p95 `POST /order` больше 300 мс в течение 2 минут. Это и есть SLA по задержке. `for: 2m` отсекает короткие всплески (GC, старт пода).
+2. `OrderErrorRateHigh` (critical): доля 5xx на `/order` больше 1% в течение 2 минут. Это вторая половина SLA: быстрый ответ с ошибкой не считается успешным заказом. Срабатывает при падении postgres, нехватке соединений, OOM в api. Считается доля, а не абсолютное число ошибок, чтобы порог не зависел от трафика.
+3. `ShopPodsPending` (warning): под в namespace `shop` находится в `Pending` больше 2 минут. Сигнал о нехватке ёмкости по requests. Если в `Pending` только batch, это ожидаемо, поэтому уровень warning. Если там окажутся `api` или `postgres`, значит, у критического пути нет резерва и отказ следующей ноды ударит по SLA.
+
+Срабатывания в первом прогоне Части 8 (по `ALERTS{alertstate="firing"}` в Prometheus):
+
+| Алерт | Firing | Причина |
+|---|---|---|
+| `OrderLatencySLABreach` | 00:50-01:25 | p95 больше 300 мс под перегрузкой |
+| `OrderErrorRateHigh` | 01:02-01:14 | рестарты postgres-1 (liveness, OOMKilled) |
+| `ShopPodsPending` | 01:01-01:28, 13 подов `batch-*` | batch не поместился по CPU requests |
+
+Все три сработали: два critical отразили реальное нарушение SLA, warning показал, что в `Pending` находится только batch.
+
+В повторном прогоне (после исправления) в состоянии firing был только `ShopPodsPending` (02:07-02:12, 15 подов batch). Оба critical-алерта остались inactive, SLA не нарушался:
+
+![](img/14-alert-firing.png)

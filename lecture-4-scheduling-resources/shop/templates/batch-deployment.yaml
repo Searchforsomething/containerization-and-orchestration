@@ -1,0 +1,38 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: batch
+  labels:
+    app.kubernetes.io/name: batch
+    {{- include "shop.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.batch.replicas }}
+  selector:
+    matchLabels:
+      app: batch
+  template:
+    metadata:
+      labels:
+        app: batch
+        app.kubernetes.io/name: batch
+        tier: batch
+        {{- include "shop.labels" . | nindent 8 }}
+    spec:
+      {{- include "shop.priorityClassName" (list . .Values.batch.priorityClass) | nindent 6 }}
+      terminationGracePeriodSeconds: 5
+      containers:
+        - name: batch
+          image: {{ .Values.batch.image }}
+          env:
+            - name: BATCH_MEMORY_MB
+              value: "{{ .Values.batch.memoryMB }}"
+            - name: BATCH_STEP_MB
+              value: "{{ .Values.batch.stepMB }}"
+            - name: BATCH_CPU_DUTY
+              value: "{{ .Values.batch.cpuDuty }}"
+          resources:
+            {{- toYaml .Values.batch.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            privileged: false
+            runAsNonRoot: true

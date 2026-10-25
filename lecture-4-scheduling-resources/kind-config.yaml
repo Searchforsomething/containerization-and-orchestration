@@ -1,0 +1,21 @@
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: shop
+kubeadmConfigPatches:
+  - |
+    kind: KubeletConfiguration
+    systemReserved:
+      cpu: "2"
+    evictionHard:
+      memory.available: "60%"
+      nodefs.available: "0%"
+      nodefs.inodesFree: "0%"
+      imagefs.available: "0%"
+    evictionPressureTransitionPeriod: 30s
+nodes:
+  - role: control-plane
+    extraPortMappings:
+      - containerPort: 30080
+        hostPort: 30080
+        protocol: TCP
+  - role: worker

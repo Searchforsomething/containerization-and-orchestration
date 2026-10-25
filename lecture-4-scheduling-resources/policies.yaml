@@ -1,0 +1,171 @@
+# 1. Обязательные лимиты ресурсов (CPU и Memory)
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-resource-limits
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: validate-resources
+      match:
+        any:
+        - resources:
+            kinds:
+              - Pod
+      exclude:
+        any:
+          - resources:
+              namespaces:
+                - kube-system
+                - kyverno
+                - cnpg-system
+                - monitoring
+                - local-path-storage
+      validate:
+        message: "CPU и Memory лимиты обязательны для всех контейнеров."
+        pattern:
+          spec:
+            containers:
+              - resources:
+                  limits:
+                    memory: "?*"
+                    cpu: "?*"
+---
+# 2. Только доверенный реестр образов
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: restrict-image-registries
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: validate-registries
+      match:
+        any:
+        - resources:
+            kinds:
+              - Pod
+      exclude:
+        any:
+          - resources:
+              namespaces:
+                - kube-system
+                - kyverno
+                - cnpg-system
+                - monitoring
+                - local-path-storage
+      validate:
+        message: "Разрешены только образы из docker.io/library, shop-api, shop-worker и shop-batch."
+        anyPattern:
+          - spec:
+              containers:
+                - image: "docker.io/library/*"
+          - spec:
+              containers:
+                - image: "shop-api:*"
+          - spec:
+              containers:
+                - image: "shop-worker:*"
+          - spec:
+              containers:
+                - image: "shop-batch:*"
+          - spec:
+              containers:
+                - image: "ghcr.io/cloudnative-pg/*"
+---
+# 3. Обязательные метки team и environment
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: require-labels
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: check-for-labels
+      match:
+        any:
+        - resources:
+            kinds:
+              - Pod
+      exclude:
+        any:
+          - resources:
+              namespaces:
+                - kube-system
+                - kyverno
+                - cnpg-system
+                - monitoring
+                - local-path-storage
+      validate:
+        message: "Метки 'team' и 'environment' обязательны."
+        pattern:
+          metadata:
+            labels:
+              team: "?*"
+              environment: "?*"
+---
+# 4. Запрет privileged-контейнеров
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: disallow-privileged
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: deny-privileged
+      match:
+        any:
+        - resources:
+            kinds:
+              - Pod
+      exclude:
+        any:
+          - resources:
+              namespaces:
+                - kube-system
+                - kyverno
+                - cnpg-system
+                - monitoring
+                - local-path-storage
+      validate:
+        message: "Privileged-контейнеры запрещены."
+        pattern:
+          spec:
+            containers:
+              - =(securityContext):
+                  =(privileged): "false"
+---
+# 5. Запрет тега latest и требование digest
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: disallow-latest-tag
+spec:
+  validationFailureAction: Enforce
+  background: true
+  rules:
+    - name: require-image-tag
+      match:
+        any:
+        - resources:
+            kinds:
+              - Pod
+      exclude:
+        any:
+          - resources:
+              namespaces:
+                - kube-system
+                - kyverno
+                - cnpg-system
+                - monitoring
+                - local-path-storage
+      validate:
+        message: "Использование тега 'latest' запрещено. Укажите конкретную версию или digest."
+        pattern:
+          spec:
+            containers:
+              - image: "!*:latest"

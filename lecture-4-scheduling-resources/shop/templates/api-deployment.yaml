@@ -1,0 +1,92 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  labels:
+    app.kubernetes.io/name: api
+    {{- include "shop.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.api.replicas }}
+  selector:
+    matchLabels:
+      app: api
+  template:
+    metadata:
+      labels:
+        app: api
+        app.kubernetes.io/name: api
+        tier: critical
+        {{- include "shop.labels" . | nindent 8 }}
+    spec:
+      {{- include "shop.priorityClassName" (list . .Values.api.priorityClass) | nindent 6 }}
+      {{- with .Values.api.spread }}
+      {{- if eq .mode "antiAffinity" }}
+      affinity:
+        podAntiAffinity:
+          {{- if eq .antiAffinity.type "required" }}
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: api
+              topologyKey: {{ .topologyKey }}
+          {{- else }}
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: api
+                topologyKey: {{ .topologyKey }}
+          {{- end }}
+      {{- else if eq .mode "topologySpread" }}
+      topologySpreadConstraints:
+        - maxSkew: {{ .topologySpread.maxSkew }}
+          topologyKey: {{ .topologyKey }}
+          whenUnsatisfiable: {{ .topologySpread.whenUnsatisfiable }}
+          labelSelector:
+            matchLabels:
+              app: api
+          matchLabelKeys:
+            - pod-template-hash
+      {{- else if ne .mode "none" }}
+      {{- fail (printf "api.spread.mode must be none|antiAffinity|topologySpread, got %q" .mode) }}
+      {{- end }}
+      {{- end }}
+      containers:
+        - name: api
+          image: {{ .Values.api.image }}
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: HEALTH_FAIL
+              value: "{{ .Values.api.healthFail }}"
+            - name: DB_HOST
+              value: postgres-rw
+            - name: DB_NAME
+              value: shop
+            # пароль генерирует CNPG при initdb и кладёт в Secret <cluster>-app
+            - name: DB_USER
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-app
+                  key: username
+            - name: DB_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-app
+                  key: password
+          resources:
+            {{- toYaml .Values.api.resources | nindent 12 }}
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 10

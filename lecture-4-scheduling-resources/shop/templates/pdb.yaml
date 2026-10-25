@@ -1,0 +1,27 @@
+{{- if .Values.pdb.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: api
+  labels:
+    {{- include "shop.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.pdb.api.minAvailable }}
+  selector:
+    matchLabels:
+      app: api
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  # не "postgres": это имя PDB самого CNPG, и при enablePDB: false
+  # оператор удаляет объект с таким именем — то есть наш
+  name: postgres-critical
+  labels:
+    {{- include "shop.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.pdb.postgres.minAvailable }}
+  selector:
+    matchLabels:
+      cnpg.io/cluster: postgres
+{{- end }}
