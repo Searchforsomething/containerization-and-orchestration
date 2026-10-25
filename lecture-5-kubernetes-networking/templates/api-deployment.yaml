@@ -1,0 +1,61 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  labels:
+    app.kubernetes.io/name: api
+    owner: student
+    team: dev
+    environment: lab
+spec:
+  replicas: {{ .Values.api.replicas }}
+  selector:
+    matchLabels:
+      app: api
+  template:
+    metadata:
+      labels:
+        app: api
+        app.kubernetes.io/name: api
+        owner: student
+        team: dev
+        environment: lab
+    spec:
+      containers:
+        - name: api
+          image: {{ .Values.api.image }}
+          ports:
+            - containerPort: 8080
+          env:
+            - name: HEALTH_FAIL
+              value: "{{ .Values.api.healthFail }}"
+            - name: DB_HOST
+              value: postgres-rw
+            - name: DB_NAME
+              value: shop
+            - name: DB_USER
+              value: shop
+            - name: DB_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-app
+                  key: password
+          resources:
+            limits:
+              cpu: 200m
+              memory: 256Mi
+            requests:
+              cpu: 100m
+              memory: 128Mi
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 10

@@ -1,0 +1,28 @@
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: postgres
+  labels:
+    app.kubernetes.io/name: postgres
+    owner: student
+    team: dev
+    environment: lab
+spec:
+  instances: {{ .Values.postgres.instances }}
+  storage:
+    size: {{ .Values.postgres.storageSize }}
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+  bootstrap:
+    initdb:
+      database: shop
+      owner: shop
+  inheritedMetadata:
+    labels:
+      team: dev
+      environment: lab

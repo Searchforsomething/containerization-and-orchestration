@@ -1,0 +1,36 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: shop-alerts
+  labels:
+    release: monitoring
+spec:
+  groups:
+    - name: shop.network
+      rules:
+        - alert: ApiNoReadyReplicas
+          expr: kube_deployment_status_replicas_ready{deployment="api"} == 0
+          for: 1m
+          labels:
+            severity: critical
+          annotations:
+            summary: "API has no ready replicas"
+            description: "All api pods are down or not ready. Orders cannot be processed."
+
+        - alert: PostgresNoReadyReplicas
+          expr: kube_statefulset_status_replicas_ready{statefulset="postgres"} == 0
+          for: 1m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Postgres has no ready replicas"
+            description: "Database is unavailable. api and worker cannot function."
+
+        - alert: NetworkPolicyNoPods
+          expr: kube_networkpolicy_status_observed_generation == 0
+          for: 2m
+          labels:
+            severity: warning
+          annotations:
+            summary: "NetworkPolicy not observed"
+            description: "A NetworkPolicy has not been applied by the CNI. Zero-trust may be broken."

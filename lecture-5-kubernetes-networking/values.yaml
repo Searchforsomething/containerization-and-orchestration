@@ -1,0 +1,28 @@
+api:
+  replicas: 4
+  image: shop-api:1.1.0
+  healthFail: "false"
+  serviceType: NodePort
+  nodePort: 30080
+
+worker:
+  replicas: 2
+  image: shop-worker:1.0.0
+
+postgres:
+  instances: 1
+  storageSize: 1Gi
+
+networkPolicy:
+  enabled: true
+  apiLabels:
+    app: api
+  workerLabels:
+    app: worker
+  postgresLabels:
+    cnpg.io/cluster: postgres
+  apiPort: 8080
+  postgresPort: 5432
+  dnsNamespace: kube-system
+  dnsLabels:
+    k8s-app: kube-dns

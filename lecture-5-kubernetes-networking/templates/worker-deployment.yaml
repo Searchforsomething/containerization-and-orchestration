@@ -1,0 +1,45 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker
+  labels:
+    app.kubernetes.io/name: worker
+    owner: student
+    team: dev
+    environment: lab
+spec:
+  replicas: {{ .Values.worker.replicas }}
+  selector:
+    matchLabels:
+      app: worker
+  template:
+    metadata:
+      labels:
+        app: worker
+        app.kubernetes.io/name: worker
+        owner: student
+        team: dev
+        environment: lab
+    spec:
+      containers:
+        - name: worker
+          image: {{ .Values.worker.image }}
+          env:
+            - name: DB_HOST
+              value: postgres-rw
+            - name: DB_NAME
+              value: shop
+            - name: DB_USER
+              value: shop
+            - name: DB_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-app
+                  key: password
+          resources:
+            limits:
+              cpu: 200m
+              memory: 256Mi
+            requests:
+              cpu: 100m
+              memory: 128Mi
