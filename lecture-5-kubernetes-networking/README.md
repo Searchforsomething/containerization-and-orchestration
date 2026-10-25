@@ -87,12 +87,12 @@ coredns-7db6d8ff4d-gs9qk                    1/1     Running   0          4h56m  
 
 Из временного пода bad-pod (без метки app=api или app=worker) после попытки подключения к postgres-rw:5432 через nc -zv команда не вернула ни succeeded, ни connection refused, а зависла. Это означает, что пакеты были отброшены NetworkPolicy
 
-✅ api -> postgres - запись в БД идет
-✅ worker -> postgres - воркер обрабатывает заказы
-✅ любой другой под -> postgres - nc: connect to postgres-rw (10.96.12.202) port 5432 (tcp) timed out: Operation in progress
-✅ любой под -> CoreDNS(kube-system) - получили адрес, все ок
-✅ внешний клиент (NodePort) -> api - получаем список заказов
-✅ api/worker → остальное - заблокировано (default-deny; egress разрешён только к postgres (порт 5432). Косвенно подтверждено: nettest → postgres timeout, api → postgres соединение устанавливается)
+  - ✅ api -> postgres - запись в БД идет
+  - ✅ worker -> postgres - воркер обрабатывает заказы
+  - ✅ любой другой под -> postgres - nc: connect to postgres-rw (10.96.12.202) port 5432 (tcp) timed out: Operation in progress
+  - ✅ любой под -> CoreDNS(kube-system) - получили адрес, все ок
+  - ✅ внешний клиент (NodePort) -> api - получаем список заказов
+  - ✅ api/worker → остальное - заблокировано (default-deny; egress разрешён только к postgres (порт 5432). Косвенно подтверждено: nettest → postgres timeout, api → postgres соединение устанавливается)
 
 ## Часть 6
 Ломаем policy случайным скриптом.
