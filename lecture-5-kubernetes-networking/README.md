@@ -73,6 +73,7 @@ coredns-7db6d8ff4d-gs9qk                    1/1     Running   0          4h56m  
 
 Возникла проблема со связью между CNPG и подом с Postgres, дополнительно создал networkpolicy-cnpg-webhook.yaml. После перезапуска CNPG удалось сделать helm upgrade.
 Политики применились
+
 ![alt text](img/9.png)
 
 ## Чвсть 5
@@ -96,6 +97,7 @@ coredns-7db6d8ff4d-gs9qk                    1/1     Running   0          4h56m  
 
 ## Часть 6
 Ломаем policy случайным скриптом.
+
 ![alt text](img/13.png)
 
 По карте трафика видим, что отбрасываются пакеты от api к Postgres. Для диагностики заходим в api-policy и видимо некорректный порт доступа к Postgres. Фиксим, дергаем ручку - работает. В карте трафика запросы не дропаются.
